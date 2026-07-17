@@ -1,0 +1,14 @@
+version: 2
+ethernets:
+  ${iface}:
+%{ if static_ip != null ~}
+    addresses:
+      - ${static_ip}
+    routes:
+      - to: default
+        via: ${gateway}
+    nameservers:
+      addresses: [${join(", ", dns)}]
+%{ else ~}
+    dhcp4: true
+%{ endif ~}

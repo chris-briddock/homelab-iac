@@ -1,0 +1,119 @@
+#cloud-config
+hostname: ${hostname}
+fqdn: ${hostname}.local
+manage_etc_hosts: true
+
+users:
+  - name: ${vm_user}
+    groups: [wheel]
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - ${ssh_public_key}
+
+package_update: true
+packages:
+  - podman
+  - qemu-guest-agent
+
+write_files:
+  - path: /etc/modules-load.d/br_netfilter.conf
+    permissions: "0644"
+    content: |
+      br_netfilter
+  - path: /etc/sysctl.d/99-bridge-nf.conf
+    permissions: "0644"
+    content: |
+      net.bridge.bridge-nf-call-iptables = 1
+      net.bridge.bridge-nf-call-ip6tables = 1
+%{ for f in extra_files ~}
+  - path: ${f.path}
+    permissions: "${f.permissions}"
+    content: |
+      ${indent(6, f.content)}
+%{ endfor ~}
+%{ if length(containers) > 0 ~}
+  - path: /etc/containers/systemd/vmnet.network
+    permissions: "0644"
+    content: |
+      [Network]
+%{ if length(dns) > 0 ~}
+      # Pin aardvark-dns upstreams; without this, podman captures whatever
+      # resolv.conf held when the network first came up, racing cloud-init's
+      # static profile.
+%{ for d in dns ~}
+      DNS=${d}
+%{ endfor ~}
+%{ endif ~}
+%{ endif ~}
+%{ for c in containers ~}
+  - path: /etc/containers/systemd/${c.name}.container
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=${c.name} container (managed by podman quadlet)
+      After=network-online.target
+      Wants=network-online.target
+%{ for d in c.depends_on ~}
+      # Wants (not Requires): a hard dependency propagates `systemctl stop`
+      # to dependents, which then stay down -- restarting a database or app
+      # container must not silently kill the caddy in front of it.
+      Wants=${d}.service
+      After=${d}.service
+%{ endfor ~}
+
+      [Container]
+      Image=${c.image}
+      ContainerName=${c.name}
+      # Podman's implicit default bridge network has DNS disabled; use a
+      # proper user-defined network (DNS enabled by default) so containers
+      # can resolve each other by name.
+      Network=vmnet.network
+%{ for p in c.ports ~}
+      PublishPort=${p}
+%{ endfor ~}
+%{ for k, v in c.environment ~}
+      Environment=${k}="${v}"
+%{ endfor ~}
+%{ for vol in c.volumes ~}
+      Volume=${vol}
+%{ endfor ~}
+%{ for a in c.extra_args ~}
+      PodmanArgs=${a}
+%{ endfor ~}
+%{ if c.user != "" ~}
+      User=${c.user}
+%{ endif ~}
+%{ if c.command != "" ~}
+      Exec=${c.command}
+%{ endif ~}
+      AutoUpdate=registry
+
+      [Service]
+      Restart=always
+      TimeoutStartSec=900
+
+      [Install]
+      WantedBy=multi-user.target
+%{ endfor ~}
+
+runcmd:
+  - [ modprobe, br_netfilter ]
+  - [ sysctl, --system ]
+  # Activate any CA anchors delivered via write_files (podman validates the
+  # HTTPS registry mirror against the system trust store).
+  - [ update-ca-trust ]
+  - [ systemctl, enable, --now, qemu-guest-agent ]
+  # NetworkManager's auto-generated "Wired connection 1" (DHCP) profile races
+  # with cloud-init's own connection profile for the same device; force the
+  # cloud-init-managed one to win.
+%{ if length(dns) > 0 ~}
+  # Router advertisements inject the ISP's IPv6 resolver, which NXDOMAINs
+  # internal names; only the configured DNS servers may be used.
+  - [ nmcli, con, mod, "cloud-init ${iface}", ipv6.ignore-auto-dns, "yes" ]
+%{ endif ~}
+  - [ nmcli, con, up, "cloud-init ${iface}" ]
+  - [ systemctl, daemon-reload ]
+%{ for c in containers ~}
+  - [ systemctl, start, "${c.name}.service" ]
+%{ endfor ~}
