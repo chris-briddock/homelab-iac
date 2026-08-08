@@ -90,7 +90,14 @@ write_files:
       AutoUpdate=registry
 
       [Service]
+%{ if c.oneshot ~}
+      # Oneshot bootstrap sidecar: run once at boot, stay "active" via
+      # RemainAfterExit so dependents ordering after it see success.
+      Type=oneshot
+      RemainAfterExit=yes
+%{ else ~}
       Restart=always
+%{ endif ~}
       TimeoutStartSec=900
 
       [Install]

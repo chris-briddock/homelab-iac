@@ -8,8 +8,8 @@ variable "pool_name" {
   type        = string
 }
 
-variable "base_volume_id" {
-  description = "libvirt volume ID of the base cloud image to clone from"
+variable "base_volume_path" {
+  description = "Host filesystem path of the base cloud image qcow2 to use as the copy-on-write backing store"
   type        = string
 }
 
@@ -99,6 +99,10 @@ variable "containers" {
     depends_on  = optional(list(string), [])
     extra_args  = optional(list(string), [])
     user        = optional(string, "")
+    # When true the generated unit is a Type=oneshot job (run once at boot,
+    # RemainAfterExit) instead of a long-running Restart=always service.
+    # Use for idempotent bootstrap sidecars (e.g. SQL init scripts).
+    oneshot = optional(bool, false)
   }))
   default = []
 }

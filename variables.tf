@@ -103,10 +103,10 @@ variable "uefi_nvram_template" {
 variable "vms" {
   description = "Map of VMs to create, keyed by name"
   type = map(object({
-    vcpu        = number
-    memory_mib  = number
-    disk_gib    = number
-    containers  = list(object({
+    vcpu       = number
+    memory_mib = number
+    disk_gib   = number
+    containers = list(object({
       name  = string
       image = string
       ports = optional(list(string), [])

@@ -32,6 +32,23 @@ locals {
     [for name, target in local.dns_cname_records : "${name} IN CNAME ${target}.${local.internal_domain}."],
   ))
 
+  # Reverse (PTR) zone for the 192.168.70.0/24 block the service IPs live in.
+  # Each A record's last octet becomes the PTR owner name.
+  dns_reverse_zone_name = "70.168.192.in-addr.arpa"
+
+  dns_ptr_records = join("\n", [
+    for name, ip in local.dns_a_records :
+    "${element(split(".", ip), 3)} IN PTR ${name}.${local.internal_domain}."
+  ])
+
+  dns_reverse_zone_file = <<-EOT
+    $ORIGIN ${local.dns_reverse_zone_name}.
+    $TTL 300
+    @ IN SOA dns.${local.internal_domain}. admin.${local.internal_domain}. 1 7200 3600 1209600 300
+    ${local.dns_ns_records}
+    ${local.dns_ptr_records}
+  EOT
+
   # Zone content only changes via VM re-provision (cloud-init), so a static
   # serial is enough.
   dns_zone_file = <<-EOT
@@ -45,6 +62,13 @@ locals {
   coredns_corefile = <<-EOT
     ${local.internal_domain} {
         file /etc/coredns/${local.internal_domain}.zone
+        prometheus 0.0.0.0:9153
+        log
+        errors
+    }
+
+    ${local.dns_reverse_zone_name} {
+        file /etc/coredns/${local.dns_reverse_zone_name}.zone
         prometheus 0.0.0.0:9153
         log
         errors
@@ -95,15 +119,15 @@ module "dns" {
 
   for_each = local.dns_vms
 
-  name           = "${each.key}-vm"
-  pool_name      = libvirt_pool.vhost.name
-  base_volume_id = libvirt_volume.base_vhost.id
-  vcpu           = 2
-  memory_mib     = 2048
-  disk_gib       = 15
-  bridge         = var.vhost_bridge
-  static_ip      = "${each.value}${var.vhost_lan_cidr_suffix}"
-  gateway        = var.vhost_gateway
+  name             = "${each.key}-vm"
+  pool_name        = libvirt_pool.vhost.name
+  base_volume_path = libvirt_volume.base_vhost.path
+  vcpu             = 2
+  memory_mib       = 2048
+  disk_gib         = 15
+  bridge           = var.vhost_bridge
+  static_ip        = "${each.value}${var.vhost_lan_cidr_suffix}"
+  gateway          = var.vhost_gateway
   # These VMs host the DNS servers, so they must not resolve through
   # themselves (image pulls at first boot happen before CoreDNS is up).
   dns            = var.vhost_dns
@@ -115,6 +139,7 @@ module "dns" {
   extra_files = [
     { path = "/etc/infra/coredns/Corefile", content = local.coredns_corefile },
     { path = "/etc/infra/coredns/${local.internal_domain}.zone", content = local.dns_zone_file },
+    { path = "/etc/infra/coredns/${local.dns_reverse_zone_name}.zone", content = local.dns_reverse_zone_file },
     local.root_ca_anchor_file,
   ]
 
@@ -133,6 +158,7 @@ module "dns" {
       volumes = [
         "/etc/infra/coredns/Corefile:/etc/coredns/Corefile:Z",
         "/etc/infra/coredns/${local.internal_domain}.zone:/etc/coredns/${local.internal_domain}.zone:Z",
+        "/etc/infra/coredns/${local.dns_reverse_zone_name}.zone:/etc/coredns/${local.dns_reverse_zone_name}.zone:Z",
       ]
     },
     {
@@ -150,24 +176,24 @@ module "ca" {
   source    = "./modules/vm"
   providers = { libvirt = libvirt.vhost }
 
-  name           = "ca-vm"
-  pool_name      = libvirt_pool.vhost.name
-  base_volume_id = libvirt_volume.base_vhost.id
-  vcpu           = 2
-  memory_mib     = 2048
-  disk_gib       = 15
-  bridge         = var.vhost_bridge
-  static_ip      = "${local.service_ips.ca}${var.vhost_lan_cidr_suffix}"
-  gateway        = var.vhost_gateway
-  dns            = local.vm_dns
-  firmware       = var.uefi_firmware
-  nvram_template = var.uefi_nvram_template
-  vm_user        = var.vm_user
-  ssh_public_key = trimspace(file(pathexpand(var.ssh_public_key_path)))
+  name             = "ca-vm"
+  pool_name        = libvirt_pool.vhost.name
+  base_volume_path = libvirt_volume.base_vhost.path
+  vcpu             = 2
+  memory_mib       = 2048
+  disk_gib         = 15
+  bridge           = var.vhost_bridge
+  static_ip        = "${local.service_ips.ca}${var.vhost_lan_cidr_suffix}"
+  gateway          = var.vhost_gateway
+  dns              = local.vm_dns
+  firmware         = var.uefi_firmware
+  nvram_template   = var.uefi_nvram_template
+  vm_user          = var.vm_user
+  ssh_public_key   = trimspace(file(pathexpand(var.ssh_public_key_path)))
 
   extra_files = [
     { path = "/etc/infra/step/ca.json", content = local.step_ca_config },
-    { path = "/etc/infra/step/root_ca.crt", content = tls_self_signed_cert.root.cert_pem },
+    { path = "/etc/infra/step/root_ca.crt", content = local.root_ca_cert_pem },
     { path = "/etc/infra/step/intermediate_ca.crt", content = tls_locally_signed_cert.intermediate.cert_pem },
     {
       path        = "/etc/infra/step/intermediate_ca_key"
@@ -180,9 +206,9 @@ module "ca" {
 
   containers = [
     {
-      name    = "step-ca"
-      image   = "docker.io/smallstep/step-ca:latest"
-      ports   = ["9000:9000"]
+      name  = "step-ca"
+      image = "docker.io/smallstep/step-ca:latest"
+      ports = ["9000:9000"]
       # The image entrypoint sees the mounted config and just runs the CA;
       # the key is unencrypted so no --password-file is needed.
       command = "/usr/local/bin/step-ca /home/step/config/ca.json"
@@ -214,24 +240,24 @@ module "registry" {
   source    = "./modules/vm"
   providers = { libvirt = libvirt.vhost }
 
-  name           = "registry-vm"
-  pool_name      = libvirt_pool.vhost.name
-  base_volume_id = libvirt_volume.base_vhost.id
-  vcpu           = 2
-  memory_mib     = 4096
-  disk_gib       = 40
-  bridge         = var.vhost_bridge
-  static_ip      = "${local.service_ips.registry}${var.vhost_lan_cidr_suffix}"
-  gateway        = var.vhost_gateway
-  dns            = local.vm_dns
-  firmware       = var.uefi_firmware
-  nvram_template = var.uefi_nvram_template
-  vm_user        = var.vm_user
-  ssh_public_key = trimspace(file(pathexpand(var.ssh_public_key_path)))
+  name             = "registry-vm"
+  pool_name        = libvirt_pool.vhost.name
+  base_volume_path = libvirt_volume.base_vhost.path
+  vcpu             = 2
+  memory_mib       = 4096
+  disk_gib         = 40
+  bridge           = var.vhost_bridge
+  static_ip        = "${local.service_ips.registry}${var.vhost_lan_cidr_suffix}"
+  gateway          = var.vhost_gateway
+  dns              = local.vm_dns
+  firmware         = var.uefi_firmware
+  nvram_template   = var.uefi_nvram_template
+  vm_user          = var.vm_user
+  ssh_public_key   = trimspace(file(pathexpand(var.ssh_public_key_path)))
 
   extra_files = [
     { path = "/etc/infra/Caddyfile", content = local.caddyfiles.registry },
-    { path = "/etc/infra/root_ca.crt", content = tls_self_signed_cert.root.cert_pem },
+    { path = "/etc/infra/root_ca.crt", content = local.root_ca_cert_pem },
     local.root_ca_anchor_file,
   ]
 

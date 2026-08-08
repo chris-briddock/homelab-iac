@@ -16,12 +16,14 @@ output "service_ips" {
     dns2       = module.dns["dns2"].ipv4
     ca         = module.ca.ipv4
     registry   = module.registry.ipv4
+    gitea      = module.gitea.ipv4
+    verdaccio  = module.verdaccio.ipv4
   }
 }
 
 output "root_ca_pem" {
   description = "Root CA certificate to install into client trust stores (e.g. /etc/pki/ca-trust/source/anchors/ + update-ca-trust on Fedora)"
-  value       = tls_self_signed_cert.root.cert_pem
+  value       = local.root_ca_cert_pem
 }
 
 output "service_urls" {
@@ -33,6 +35,8 @@ output "service_urls" {
     prometheus = "https://prometheus.${local.internal_domain}"
     aspire     = "https://aspire.${local.internal_domain}"
     registry   = "https://registry.${local.internal_domain}"
+    gitea      = "https://gitea.${local.internal_domain}"
+    verdaccio  = "https://verdaccio.${local.internal_domain}"
     ca         = "https://ca.${local.internal_domain}:9000"
   }
 }
@@ -48,5 +52,9 @@ output "secrets" {
     penpot_secret_key        = random_password.penpot_secret_key.result
     penpot_postgres_password = random_password.penpot_postgres.result
     grafana_admin_password   = random_password.grafana_admin.result
+    gitea_db_password        = random_password.gitea_db.result
+    gitea_internal_token     = random_password.gitea_internal_token.result
+    gitea_secret_key         = random_password.gitea_secret_key.result
+    gitea_jwt_secret         = random_password.gitea_jwt_secret.result
   }
 }

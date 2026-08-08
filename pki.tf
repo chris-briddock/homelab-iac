@@ -4,6 +4,18 @@
 # provisioned onto the infra VM for step-ca to issue leaf certs via ACME.
 # Keys living in tfstate is an accepted tradeoff here, consistent with the
 # random_password usage elsewhere in this config.
+#
+# 2026-07: tfstate was lost outside this config's control. The root private
+# key existed only there, so tls_private_key.root/tls_self_signed_cert.root
+# can never be reconstructed to match the real, already-deployed root CA --
+# every VM's trust anchor now instead reads the checked-in public cert at
+# pki/root-ca-cert.pem (see local.root_ca_cert_pem in services.tf) rather
+# than tls_self_signed_cert.root.cert_pem. These two resources are left in
+# place below only because tls_locally_signed_cert.intermediate still
+# references them structurally; they are otherwise vestigial. ca-vm's own
+# intermediate cert/key (infra.tf) have the same unrecoverable-root problem
+# and so ca-vm can never be safely `-replace`'d without first deciding how
+# to regenerate and redistribute a new root CA -- a separate, bigger call.
 
 resource "tls_private_key" "root" {
   algorithm   = "ECDSA"

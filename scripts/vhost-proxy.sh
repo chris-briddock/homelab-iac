@@ -6,8 +6,9 @@
 # fails with "Cannot find start time for pid ..." when connecting directly
 # via qemu+ssh://. Real virsh and virt-ssh-helper don't have this problem, so
 # this script reproduces the same connection virsh makes, exposed as a local
-# unix socket that the provider can reach with a plain qemu+unix:// URI (see
-# providers.tf).
+# unix socket that the provider can reach with a plain qemu:// URI (see
+# providers.tf — 0.9.x's dialer factory uses newLocalDialer when no transport
+# or host is specified, which reads the "socket" query parameter).
 #
 # Must be running before any `tofu` command that touches the vhost provider.
 set -euo pipefail
