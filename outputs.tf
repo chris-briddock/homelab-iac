@@ -18,6 +18,7 @@ output "service_ips" {
     registry   = module.registry.ipv4
     gitea      = module.gitea.ipv4
     verdaccio  = module.verdaccio.ipv4
+    nfs        = module.nfs.ipv4
   }
 }
 
@@ -27,7 +28,7 @@ output "root_ca_pem" {
 }
 
 output "service_urls" {
-  description = "HTTPS URLs for the web services (requires DNS pointed at the infra VM and the root CA trusted)"
+  description = "HTTPS URLs for the web services (requires DNS pointed at the infra VM and the root CA trusted; nfs is not HTTP -- listed as its NFSv4 endpoint for completeness; dns/dns2 are the RFC 8484 DoH endpoints, not web UIs)"
   value = {
     qvault     = "https://qvault.${local.internal_domain}"
     penpot     = "https://penpot.${local.internal_domain}"
@@ -38,6 +39,9 @@ output "service_urls" {
     gitea      = "https://gitea.${local.internal_domain}"
     verdaccio  = "https://verdaccio.${local.internal_domain}"
     ca         = "https://ca.${local.internal_domain}:9000"
+    nfs        = "nfs://nfs.${local.internal_domain}/gitea"
+    dns        = "https://dns.${local.internal_domain}/dns-query"
+    dns2       = "https://dns2.${local.internal_domain}/dns-query"
   }
 }
 

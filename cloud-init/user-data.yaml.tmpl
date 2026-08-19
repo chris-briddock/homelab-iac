@@ -15,6 +15,9 @@ package_update: true
 packages:
   - podman
   - qemu-guest-agent
+%{ for p in extra_packages ~}
+  - ${p}
+%{ endfor ~}
 
 write_files:
   - path: /etc/modules-load.d/br_netfilter.conf
@@ -26,6 +29,15 @@ write_files:
     content: |
       net.bridge.bridge-nf-call-iptables = 1
       net.bridge.bridge-nf-call-ip6tables = 1
+  # dnf5-automatic defaults to download-only (see
+  # /usr/share/dnf5/dnf5-plugins/automatic.conf); override via the single
+  # supported override file. reboot stays "never" (distro default) --
+  # kernel upgrades take effect on the next manual/maintenance reboot.
+  - path: /etc/dnf/automatic.conf
+    permissions: "0644"
+    content: |
+      [commands]
+      apply_updates = yes
 %{ for f in extra_files ~}
   - path: ${f.path}
     permissions: "${f.permissions}"
@@ -121,6 +133,16 @@ runcmd:
 %{ endif ~}
   - [ nmcli, con, up, "cloud-init ${iface}" ]
   - [ systemctl, daemon-reload ]
+  # Automatic updates, two layers:
+  #  - host packages: dnf5-automatic applies them daily (config above).
+  #  - container images: every quadlet carries AutoUpdate=registry; this
+  #    timer runs `podman auto-update` daily, pulling new images and
+  #    restarting only the affected containers.
+  - [ systemctl, enable, --now, dnf5-automatic.timer ]
+  - [ systemctl, enable, --now, podman-auto-update.timer ]
+%{ for r in extra_runcmd ~}
+  - ${jsonencode(r)}
+%{ endfor ~}
 %{ for c in containers ~}
   - [ systemctl, start, "${c.name}.service" ]
 %{ endfor ~}

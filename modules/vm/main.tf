@@ -13,6 +13,8 @@ resource "libvirt_cloudinit_disk" "init" {
     extra_files    = var.extra_files
     iface          = var.primary_iface
     dns            = var.dns
+    extra_packages = var.extra_packages
+    extra_runcmd   = var.extra_runcmd
   })
 
   meta_data = yamlencode({
@@ -35,14 +37,15 @@ resource "libvirt_volume" "cloudinit" {
   name = "${var.name}-cloudinit.iso"
   pool = var.pool_name
 
-  # NOTE: format type must be "iso" (not "raw") — the provider detects the
-  # uploaded cloud-init ISO's format and returns "iso", so "raw" causes a
-  # "Provider produced inconsistent result after apply" error.
-  target = {
-    format = {
-      type = "iso"
-    }
-  }
+  # Do NOT declare target.format.type here. libvirt fills the volume XML's
+  # <format> by probing the uploaded bytes, and for a small cloud-init ISO it
+  # nondeterministically reports "iso" (detected ISO9660 signature) or "raw"
+  # (small file / sparse / refresh race). Both a fixed "iso" and a fixed "raw"
+  # therefore produce 'Provider produced inconsistent result after apply' on
+  # roughly half the creates. Omitting the format leaves nothing to contradict
+  # and the create-upload path still writes the ISO onto a raw volume, which
+  # the guest attaches as a cdrom below.
+  target = {}
 
   create = {
     content = {
