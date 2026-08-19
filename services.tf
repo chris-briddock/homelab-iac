@@ -12,6 +12,7 @@ locals {
     dns2       = "192.168.70.19"
     gitea      = "192.168.70.20"
     verdaccio  = "192.168.70.21"
+    nfs        = "192.168.70.22"
   }
 
   # Shared by penpot-backend (enforcement) and penpot-frontend (UI rendering
@@ -654,12 +655,33 @@ module "gitea" {
   vm_user          = var.vm_user
   ssh_public_key   = trimspace(file(pathexpand(var.ssh_public_key_path)))
 
+  # nfs-utils pulls in mount.nfs4 + rpc.statd needed for the fstab entry
+  # below; the gitea container's data dir lives on the nfs VM.
+  extra_packages = ["nfs-utils"]
+
   extra_files = concat(
     [
       { path = "/etc/infra/gitea/init-db.sh", content = local.gitea_init_script, permissions = "0755" },
+      {
+        path        = "/etc/infra/gitea/gitea.nfs.fstab"
+        permissions = "0644"
+        # x-systemd.before targets the quadlet-generated unit name (container
+        # name + .service), i.e. gitea.service -- NOT podman-gitea.service.
+        content     = "${local.service_ips.nfs}:/gitea /var/lib/gitea nfs4 rw,hard,intr,noatime,_netdev,x-systemd.automount,x-systemd.idle-timeout=600,x-systemd.before=gitea.service 0 0\n"
+      },
     ],
     local.caddy_extra_files.gitea,
   )
+
+  extra_runcmd = [
+    # Register the NFS mount in fstab and activate it now (cloud-init does
+    # not process fstab on first boot once the system is already up);
+    # daemon-reload in runcmd above has already run by the time this fires.
+    ["mkdir", "-p", "/var/lib/gitea"],
+    ["sh", "-c", "cat /etc/infra/gitea/gitea.nfs.fstab >> /etc/fstab"],
+    ["systemctl", "daemon-reload"],
+    ["mount", "/var/lib/gitea"],
+  ]
 
   containers = [
     {
@@ -674,9 +696,11 @@ module "gitea" {
       oneshot    = true
     },
     {
-      name       = "gitea"
-      image      = "docker.io/gitea/gitea:1"
-      ports      = ["2222:2222"]
+      name  = "gitea"
+      image = "docker.io/gitea/gitea:1"
+      # Host port 2222 forwards to the container's sshd on port 22.
+      # Gitea itself only listens on 3000 (HTTP) and 22 (SSH) inside the container.
+      ports      = ["2222:22"]
       depends_on = ["gitea-db-init"]
       environment = {
         GITEA__database__DB_TYPE        = "postgres"
@@ -694,7 +718,10 @@ module "gitea" {
         GITEA__oauth2__JWT_SECRET       = random_password.gitea_jwt_secret.result
         GITEA__log__LEVEL               = "Info"
       }
-      volumes = ["gitea-data:/data"]
+      # Bind mount, not a named volume: /var/lib/gitea is the NFS export on
+      # the nfs VM, so rebuilding this VM (even replacing its root disk)
+      # keeps the git repos. Replaces the old gitea-data named volume.
+      volumes = ["/var/lib/gitea:/data:Z"]
     },
     {
       name       = "caddy"
@@ -827,3 +854,106 @@ module "verdaccio" {
     },
   ]
 }
+
+# ---------------------------------------------------------------------------
+# NFS server: central durable store for service data that must survive a
+# consumer VM rebuild (git repos first; other services can add exports later).
+# Runs erichough/nfs-server (kernel NFS in a container), NFSv4-only on 2049.
+# Exports live under /exports on a single podman named volume: replacing the
+# nfs VM's disk still wipes data, but replacing any *consumer* (gitea, ...)
+# does NOT -- that's the whole point.
+# ---------------------------------------------------------------------------
+locals {
+  # Client CIDR allowed to mount. Only hosts with an address in the
+  # service range may mount. The admin laptop joins it via a secondary
+  # address (192.168.70.254/22 on the LAN interface) instead of widening
+  # the export to the whole LAN supernet.
+  nfs_client_cidr = "192.168.70.0/24"
+
+  # Gitea runs as uid 1000 (user `git`) inside the container; squash all
+  # client writes to that uid/gid so files it creates round-trip owned by
+  # git regardless of client-side identity.
+  # NFSv4 needs an fsid=0 pseudo-root: clients mount paths relative to it.
+  # Without this line, mounting 192.168.70.22:/gitea fails with
+  # "No such file or directory" because /gitea doesn't exist in the pseudo-fs.
+  # The root must be rw: when a client mounts the child path through the
+  # pseudo-root, the kernel attributes the mount to the fsid=0 export -- if
+  # that root is ro, the child mount is silently ro too (observed on the
+  # gitea VM). There is nothing to write into the root itself, so rw here
+  # is not a real exposure.
+  nfs_exports = <<-EOT
+    /exports       ${local.nfs_client_cidr}(rw,async,no_subtree_check,no_root_squash,fsid=0)
+    /exports/gitea ${local.nfs_client_cidr}(rw,async,no_subtree_check,no_root_squash,all_squash,anonuid=1000,anongid=1000)
+  EOT
+}
+
+module "nfs" {
+  source    = "./modules/vm"
+  providers = { libvirt = libvirt.vhost }
+
+  name             = "nfs-vm"
+  pool_name        = libvirt_pool.vhost.name
+  base_volume_path = libvirt_volume.base_vhost.path
+  vcpu             = 1
+  memory_mib       = 2048
+  disk_gib         = 50
+  bridge           = var.vhost_bridge
+  static_ip        = "${local.service_ips.nfs}${var.vhost_lan_cidr_suffix}"
+  gateway          = var.vhost_gateway
+  dns              = local.vm_dns
+  firmware         = var.uefi_firmware
+  nvram_template   = var.uefi_nvram_template
+  vm_user          = var.vm_user
+  ssh_public_key   = trimspace(file(pathexpand(var.ssh_public_key_path)))
+
+  extra_files = [
+    { path = "/etc/infra/nfs/exports", content = local.nfs_exports, permissions = "0644" },
+    # Load kernel nfsd on boot (the container entrypoint runs modprobe nfsd
+    # but needs the host kernel to have it available; auto-load at boot).
+    {
+      path        = "/etc/modules-load.d/nfs.conf"
+      permissions = "0644"
+      content     = "nfs\nnfsd\n"
+    },
+  ]
+
+  # Load now (one-off; the modules-load.d entry covers subsequent boots).
+  # Also create the per-service export dirs inside the bind-mounted host
+  # dir, with ownership matching the anonuid/anongid used in the exports
+  # (1000:1000 for gitea), so the container's exportfs doesn't fail with
+  # "No such file or Directory" and squash-mapped writes round-trip as the
+  # caller-expected uid/gid.
+  extra_runcmd = [
+    ["modprobe", "nfs"],
+    ["modprobe", "nfsd"],
+    ["mkdir", "-p", "/srv/nfs/gitea"],
+    ["chown", "1000:1000", "/srv/nfs/gitea"],
+  ]
+
+  containers = [
+    {
+      name  = "nfs-server"
+      image = "docker.io/erichough/nfs-server:2.2.1"
+      # NFSv4-only: kernel nfsd on 2049/tcp; no rpcbind/mountd/lockd needed
+      # for v4, so no other ports get published. The image's entrypoint
+      # accepts these flags to disable the legacy versions and listener.
+      ports   = ["2049:2049"]
+      command = "--no-udp --no-nfs-version 2 --no-nfs-version 3"
+      # Container needs CAP_SYS_ADMIN / SETPCAP / MKNOD to load+run kernel
+      # nfsd; extra_args maps to PodmanArgs= in the generated quadlet.
+      extra_args = ["--privileged"]
+      volumes = [
+        "/etc/infra/nfs/exports:/etc/exports:Z",
+        # Host bind mount (not named volume): we own /srv/nfs on the VM so
+        # per-service export dirs have boot-time-controlled ownership.
+        "/srv/nfs:/exports:Z",
+      ]
+    },
+    {
+      name  = "node-exporter"
+      image = "quay.io/prometheus/node-exporter:latest"
+      ports = ["9100:9100"]
+    },
+  ]
+}
+

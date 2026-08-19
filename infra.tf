@@ -60,6 +60,14 @@ locals {
   EOT
 
   coredns_corefile = <<-EOT
+    # Bare zone blocks serve legacy plaintext DNS on :53 only. The DoH
+    # listener below (https://.:8053) is a SEPARATE server block and must
+    # declare its own `file` zones with an explicit zone argument -- CoreDNS
+    # builds an independent plugin chain per server-block, so the lab.internal
+    # zone loaded here does NOT cross over to the https block. A bare
+    # `file /path` (no zone arg) inside https://.:8053 would wrongly bind the
+    # file to the root zone "."; the explicit `file <path> lab.internal`
+    # form is required so the authoritative data is served for DoH queries.
     ${local.internal_domain} {
         file /etc/coredns/${local.internal_domain}.zone
         prometheus 0.0.0.0:9153
@@ -75,13 +83,74 @@ locals {
     }
 
     . {
-        forward . ${join(" ", var.vhost_dns)}
+        # DoT to Cloudflare's anycast, authenticated by the well-known
+        # tls_servername (not just PKI), so the upstream leg of every query
+        # that leaves the lab is encrypted.
+        forward . tls://1.1.1.1 tls://1.0.0.1 {
+            tls_servername cloudflare-dns.com
+        }
         cache 300
         prometheus 0.0.0.0:9153
         log
         errors
     }
+
+    # Internal DoH listener for the caddy front-end pod. Caddy on :443
+    # reverse-proxies HTTPS to this. The server-block zone is "." (root),
+    # so the `file` directives MUST carry an explicit zone argument --
+    # without it CoreDNS would bind the zone file to "." (wrong). With the
+    # explicit zone, lab.internal and reverse-zone queries are answered
+    # authoritatively over DoH; anything else falls through to `forward`
+    # (upstream DoT to Cloudflare).
+    https://.:8053 {
+        file /etc/coredns/${local.internal_domain}.zone ${local.internal_domain}
+        file /etc/coredns/${local.dns_reverse_zone_name}.zone ${local.dns_reverse_zone_name}
+        forward . tls://1.1.1.1 tls://1.0.0.1 {
+            tls_servername cloudflare-dns.com
+        }
+        cache 300
+        prometheus 0.0.0.0:9153
+        log
+        errors
+        tls /etc/coredns/doh-tls.crt /etc/coredns/doh-tls.key
+    }
   EOT
+
+  # DoH front-end for the two dns VMs. CoreDNS serves :53 for legacy clients
+  # and :8053 for the internal DoH leg (self-signed TLS, HTTP traffic only
+  # inside the podman user network). Caddy on :443 terminates TLS using an
+  # ACME cert from our step-ca and reverse-proxies RFC 8484 /dns-query to
+  # coredns:8053 — HTTPS between caddy and CoreDNS, so the DNS payload stays
+  # encrypted end-to-end. The upstream cert is self-signed; tls_insecure_skip_verify
+  # is safe because the network is private and caddy never validates the name.
+  #
+  # Each dns VM's Caddyfile contains ONLY its own site block — putting both
+  # VMs' site blocks on one VM would have that VM's caddy try (and fail) to
+  # ACME the other VM's cert, because tls-alpn-01 to the other name is
+  # unreachable until the other VM's caddy is up. The dns_caddyfile function
+  # is called per-instance via the `name` argument from the dns_vms for_each loop.
+  dns_caddyfile_per_vm = {
+    for name in sort(keys(local.dns_vms)) : name => <<-EOT
+      ${name}.${local.internal_domain} {
+          handle /dns-query* {
+              reverse_proxy https://coredns:8053 {
+                  transport http {
+                      tls_insecure_skip_verify
+                  }
+              }
+          }
+          handle {
+              respond "Not Found" 404
+          }
+          tls {
+              issuer acme {
+                  dir https://ca.${local.internal_domain}:9000/acme/acme/directory
+                  trusted_roots /etc/caddy/root_ca.crt
+              }
+          }
+      }
+    EOT
+  }
 
   step_ca_config = jsonencode({
     root     = "/home/step/certs/root_ca.crt"
@@ -136,10 +205,30 @@ module "dns" {
   vm_user        = var.vm_user
   ssh_public_key = trimspace(file(pathexpand(var.ssh_public_key_path)))
 
+  # Self-signed TLS cert for CoreDNS's internal :8053 DoH listener (caddy
+  # talks to it inside the podman network; never externally visible).
+  # Generated once at cloud-init; caddy upstreams with
+  # tls_insecure_skip_verify so the cert never needs renewal. openssl
+  # writes the key mode-0600 root-only; chmod to 0644 because coredns
+  # runs as a non-root uid inside the container and cannot otherwise read
+  # it (the key is for an internal self-signed cert whose secrecy is not
+  # part of the DoH security model -- the client-TLS trust boundary is
+  # caddy's step-ca ACME cert on :443).
+  extra_runcmd = [
+    ["openssl", "req", "-x509", "-nodes", "-newkey", "rsa:2048",
+     "-keyout", "/etc/infra/coredns/doh-tls.key",
+     "-out", "/etc/infra/coredns/doh-tls.crt",
+     "-days", "3650",
+     "-subj", "/CN=coredns"],
+    ["chmod", "644", "/etc/infra/coredns/doh-tls.key", "/etc/infra/coredns/doh-tls.crt"],
+  ]
+
   extra_files = [
     { path = "/etc/infra/coredns/Corefile", content = local.coredns_corefile },
     { path = "/etc/infra/coredns/${local.internal_domain}.zone", content = local.dns_zone_file },
     { path = "/etc/infra/coredns/${local.dns_reverse_zone_name}.zone", content = local.dns_reverse_zone_file },
+    { path = "/etc/infra/Caddyfile", content = local.dns_caddyfile_per_vm[each.key] },
+    { path = "/etc/infra/root_ca.crt", content = local.root_ca_cert_pem },
     local.root_ca_anchor_file,
   ]
 
@@ -155,10 +244,42 @@ module "dns" {
         "9153:9153",
       ]
       command = "-conf /etc/coredns/Corefile"
+      # The doh-tls cert/key mounts are required by the tls directive in the
+      # https://.:8053 block; without them CoreDNS fails to start the DoH
+      # listener on a fresh build (the cert is generated by extra_runcmd).
       volumes = [
         "/etc/infra/coredns/Corefile:/etc/coredns/Corefile:Z",
         "/etc/infra/coredns/${local.internal_domain}.zone:/etc/coredns/${local.internal_domain}.zone:Z",
         "/etc/infra/coredns/${local.dns_reverse_zone_name}.zone:/etc/coredns/${local.dns_reverse_zone_name}.zone:Z",
+        "/etc/infra/coredns/doh-tls.crt:/etc/coredns/doh-tls.crt:Z",
+        "/etc/infra/coredns/doh-tls.key:/etc/coredns/doh-tls.key:Z",
+      ]
+    },
+    {
+      # DoH front for CoreDNS. Terminates TLS on :443 with a step-ca ACME
+      # cert covering this VM's own <name>.lab.internal and reverse-proxies
+      # RFC 8484 /dns-query to the coredns container by container-name DNS
+      # on the shared vmnet network. Plain :53/udp+tcp on coredns stays
+      # published for LAN clients that haven't moved to DoH yet.
+      name       = "caddy"
+      image      = "docker.io/library/caddy:latest"
+      # :80 is required for ACME http-01 validation: step-ca reaches
+      # http://<name>.lab.internal:80/.well-known/acme-challenge/... from the
+      # ca VM. (Earlier attempts with only 443:443 published saw caddy log
+      # `trying to solve challenge http-01` and then stall forever because
+      # step-ca had nothing to talk to on :80.)
+      ports      = ["80:80", "443:443"]
+      depends_on = ["coredns"]
+      # The container's podman user-network upstreams aardvark-dns's
+      # resolver for *lab-internal* names back to var.vhost_dns (LAN router
+      # + 1.1.1.1), which doesn't know lab.internal. Static host entries
+      # pin ca.lab.internal so caddy's ACME client can reach the CA without
+      # needing DNS changes.
+      extra_args = ["--add-host", "ca.lab.internal:192.168.70.18"]
+      volumes = [
+        "/etc/infra/Caddyfile:/etc/caddy/Caddyfile:Z",
+        "/etc/infra/root_ca.crt:/etc/caddy/root_ca.crt:Z",
+        "caddy-data:/data",
       ]
     },
     {

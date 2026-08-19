@@ -19,5 +19,6 @@ VHOST_HOST="${VHOST_HOST:-192.168.70.1}"
 VHOST_KEYFILE="${VHOST_SSH_KEYFILE:-$HOME/.ssh/fedora_deploy_ed25519}"
 
 rm -f "$SOCKET_PATH"
+echo "Starting proxy"
 exec ncat -lU "$SOCKET_PATH" -k --sh-exec \
   "ssh -i ${VHOST_KEYFILE} -o BatchMode=yes ${VHOST_USER}@${VHOST_HOST} virt-ssh-helper qemu:///system"

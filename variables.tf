@@ -4,6 +4,15 @@ variable "libvirt_uri" {
   default     = "qemu:///system"
 }
 
+# Passphrase for OpenTofu state/plan encryption (PBKDF2 -> AES-GCM). Supply via
+# the TF_VAR_tf_encryption_passphrase env var; never commit it. Sensitive so it
+# is not echoed in plans/output.
+variable "tf_encryption_passphrase" {
+  description = "Passphrase for OpenTofu state/plan encryption (supply via TF_VAR_tf_encryption_passphrase)"
+  type        = string
+  sensitive   = true
+}
+
 variable "pool_name" {
   description = "Name of the libvirt storage pool used for VM disks"
   type        = string

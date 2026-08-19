@@ -116,3 +116,15 @@ variable "extra_files" {
   }))
   default = []
 }
+
+variable "extra_packages" {
+  description = "Additional OS packages to install via cloud-init on top of the baseline (podman, qemu-guest-agent)"
+  type        = list(string)
+  default     = []
+}
+
+variable "extra_runcmd" {
+  description = "Additional runcmd entries appended after the baseline steps. Each entry is a list (argv form, run verbatim by cloud-init)."
+  type        = list(list(string))
+  default     = []
+}
