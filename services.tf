@@ -159,7 +159,7 @@ module "surrealdb" {
   pool_name        = libvirt_pool.vhost.name
   base_volume_path = libvirt_volume.base_vhost.path
   vcpu             = 4
-  memory_mib       = 8192
+  memory_mib       = 4096
   disk_gib         = 15
   bridge           = var.vhost_bridge
   static_ip        = "${local.service_ips.surrealdb}${var.vhost_lan_cidr_suffix}"
@@ -211,7 +211,7 @@ module "postgres" {
   pool_name        = libvirt_pool.vhost.name
   base_volume_path = libvirt_volume.base_vhost.path
   vcpu             = 4
-  memory_mib       = 8192
+  memory_mib       = 4096
   disk_gib         = 20
   bridge           = var.vhost_bridge
   static_ip        = "${local.service_ips.postgres}${var.vhost_lan_cidr_suffix}"
@@ -262,7 +262,7 @@ module "qvault" {
   pool_name        = libvirt_pool.vhost.name
   base_volume_path = libvirt_volume.base_vhost.path
   vcpu             = 4
-  memory_mib       = 4096
+  memory_mib       = 2048
   disk_gib         = 15
   bridge           = var.vhost_bridge
   static_ip        = "${local.service_ips.qvault}${var.vhost_lan_cidr_suffix}"
@@ -331,7 +331,7 @@ module "penpot" {
   pool_name        = libvirt_pool.vhost.name
   base_volume_path = libvirt_volume.base_vhost.path
   vcpu             = 6
-  memory_mib       = 8192
+  memory_mib       = 4096
   disk_gib         = 30
   bridge           = var.vhost_bridge
   static_ip        = "${local.service_ips.penpot}${var.vhost_lan_cidr_suffix}"
@@ -467,7 +467,7 @@ module "monitoring" {
   pool_name        = libvirt_pool.vhost.name
   base_volume_path = libvirt_volume.base_vhost.path
   vcpu             = 4
-  memory_mib       = 8192
+  memory_mib       = 2048
   disk_gib         = 20
   bridge           = var.vhost_bridge
   static_ip        = "${local.service_ips.monitoring}${var.vhost_lan_cidr_suffix}"
@@ -539,7 +539,7 @@ module "aspire" {
   pool_name        = libvirt_pool.vhost.name
   base_volume_path = libvirt_volume.base_vhost.path
   vcpu             = 2
-  memory_mib       = 4096
+  memory_mib       = 2048
   disk_gib         = 15
   bridge           = var.vhost_bridge
   static_ip        = "${local.service_ips.aspire}${var.vhost_lan_cidr_suffix}"
