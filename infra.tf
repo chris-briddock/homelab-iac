@@ -192,7 +192,7 @@ module "dns" {
   pool_name        = libvirt_pool.vhost.name
   base_volume_path = libvirt_volume.base_vhost.path
   vcpu             = 2
-  memory_mib       = 2048
+  memory_mib       = 1024
   disk_gib         = 15
   bridge           = var.vhost_bridge
   static_ip        = "${each.value}${var.vhost_lan_cidr_suffix}"
@@ -301,7 +301,7 @@ module "ca" {
   pool_name        = libvirt_pool.vhost.name
   base_volume_path = libvirt_volume.base_vhost.path
   vcpu             = 2
-  memory_mib       = 2048
+  memory_mib       = 1024
   disk_gib         = 15
   bridge           = var.vhost_bridge
   static_ip        = "${local.service_ips.ca}${var.vhost_lan_cidr_suffix}"
@@ -365,7 +365,7 @@ module "registry" {
   pool_name        = libvirt_pool.vhost.name
   base_volume_path = libvirt_volume.base_vhost.path
   vcpu             = 2
-  memory_mib       = 4096
+  memory_mib       = 2048
   disk_gib         = 40
   bridge           = var.vhost_bridge
   static_ip        = "${local.service_ips.registry}${var.vhost_lan_cidr_suffix}"
