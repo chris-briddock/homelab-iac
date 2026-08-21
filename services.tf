@@ -28,21 +28,21 @@ locals {
   # server's NXDOMAIN for lab.internal as final.
   vm_dns = [local.service_ips.dns, local.service_ips.dns2]
 
-  # The root CA's private key only ever lived in tfstate (see pki.tf) and was
-  # lost along with it. The public cert is not secret and is already trusted
-  # everywhere, so it's captured here as a checked-in file instead of being
-  # re-derived from the (now unrecoverable) tls_self_signed_cert.root
-  # resource -- keeps every VM's trust anchor byte-identical to what's
-  # actually deployed, without depending on a resource we can never bring
-  # back into state.
-  root_ca_cert_pem = file("${path.module}/pki/root-ca-cert.pem")
+  # The PKI is file-based now (see pki.tf): scripts/gen-pki.sh minted the
+  # root + intermediate CA as local files, with private keys git-ignored and
+  # kept off tfstate entirely. The root cert is public and committed, so the
+  # trust anchor is a plain file read. (pki/root-ca-cert.pem is the DEAD
+  # previous root -- key lost with a prior tfstate; reference only.)
+  root_ca_cert_pem = file("${path.module}/pki/root-ca.crt")
 
   # Caddyfiles for the per-VM reverse proxies, keyed by VM. Certs come from
   # step-ca on the infra VM via ACME; acme_ca_root trusts its TLS endpoint.
   caddy_sites = {
-    qvault     = { qvault = "qvault:3000" }
-    penpot     = { penpot = "penpot-frontend:8080" }
-    monitoring = { grafana = "grafana:3000", prometheus = "prometheus:9090" }
+    qvault = { qvault = "qvault:3000" }
+    penpot = { penpot = "penpot-frontend:8080" }
+    # ntfy is fronted by caddy so the phone app can subscribe over HTTPS with
+    # the step-ca cert (the LAN already trusts the lab root CA).
+    monitoring = { grafana = "grafana:3000", prometheus = "prometheus:9090", ntfy = "ntfy:80" }
     aspire     = { aspire = "aspire-dashboard:18888" }
     registry   = { registry = "registry:5000" }
     gitea      = { gitea = "gitea:3000" }
@@ -263,7 +263,7 @@ module "qvault" {
   base_volume_path = libvirt_volume.base_vhost.path
   vcpu             = 4
   memory_mib       = 2048
-  disk_gib         = 15
+  disk_gib         = 5
   bridge           = var.vhost_bridge
   static_ip        = "${local.service_ips.qvault}${var.vhost_lan_cidr_suffix}"
   gateway          = var.vhost_gateway
@@ -332,7 +332,7 @@ module "penpot" {
   base_volume_path = libvirt_volume.base_vhost.path
   vcpu             = 6
   memory_mib       = 4096
-  disk_gib         = 30
+  disk_gib         = 15
   bridge           = var.vhost_bridge
   static_ip        = "${local.service_ips.penpot}${var.vhost_lan_cidr_suffix}"
   gateway          = var.vhost_gateway
@@ -417,13 +417,57 @@ module "penpot" {
 # Monitoring: Prometheus + Grafana
 # ---------------------------------------------------------------------------
 locals {
+  # HTTP(S) web services to blackbox-probe. Module: http_2xx (GET, follow
+  # redirects, any 2xx). Aspire's dashboard is an OTLP/grpc + rich UI host --
+  # 18888 serves its HTML; probing / keeps it simple and catches a dead VM.
+  blackbox_http_targets = [
+    "https://qvault.${local.internal_domain}",
+    "https://penpot.${local.internal_domain}",
+    "https://grafana.${local.internal_domain}/api/health",
+    "https://prometheus.${local.internal_domain}/-/healthy",
+    "https://aspire.${local.internal_domain}",
+    "https://registry.${local.internal_domain}/v2/", # 200 from the registry root means docker.io cache is serving
+    "https://gitea.${local.internal_domain}",
+    "https://verdaccio.${local.internal_domain}",
+  ]
+
+  # Non-HTTP endpoints worth a TCP liveness check (no app-level probe; a
+  # refused connection is the actionable failure here).
+  blackbox_tcp_targets = [
+    "${local.service_ips.postgres}:5432",
+    "${local.service_ips.surrealdb}:8000",
+    "${local.service_ips.nfs}:2049",
+    "${local.service_ips.gitea}:2222",
+  ]
+
+  # DNS answers are load-bearing for the whole lab -- probe that each CoreDNS
+  # instance actually resolves the zone, not just that the port accepts
+  # connections. blackbox's dns module does a full question/answer round-trip.
+  blackbox_dns_targets = [
+    "${local.service_ips.dns}:53",
+    "${local.service_ips.dns2}:53",
+  ]
+
   prometheus_config = <<-YAML
     global:
       scrape_interval: 15s
+      evaluation_interval: 15s
+
+    rule_files:
+      - /etc/prometheus/rules/*.yml
+
+    alerting:
+      alertmanagers:
+        - static_configs:
+            - targets: ["alertmanager:9093"]
+
     scrape_configs:
       - job_name: prometheus
         static_configs:
           - targets: ["localhost:9090"]
+      - job_name: alertmanager
+        static_configs:
+          - targets: ["alertmanager:9093"]
       - job_name: node-exporters
         static_configs:
           - targets:
@@ -437,6 +481,7 @@ locals {
               - "${local.service_ips.registry}:9100"
               - "${local.service_ips.gitea}:9100"
               - "${local.service_ips.verdaccio}:9100"
+              - "${local.service_ips.nfs}:9100"
               - "node-exporter:9100"
       - job_name: postgres
         static_configs:
@@ -446,6 +491,204 @@ locals {
           - targets:
               - "${local.service_ips.dns}:9153"
               - "${local.service_ips.dns2}:9153"
+      # Uptime probes. The exporter runs as a sibling container (blackbox:9115);
+      # relabelling swaps the *reported* instance to the probe target so the
+      # alert/user sees e.g. instance="https://gitea.lab.internal", not the
+      # exporter's own address. Based on the stock blackbox example:
+      # https://github.com/prometheus/blackbox_exporter#prometheus-configuration
+      - job_name: blackbox-http
+        metrics_path: /probe
+        params:
+          module: [http_2xx]
+        static_configs:
+          - targets:
+%{for t in local.blackbox_http_targets~}
+              - "${t}"
+%{endfor~}
+        relabel_configs:
+          - source_labels: [__address__]
+            target_label: __param_target
+          - source_labels: [__param_target]
+            target_label: instance
+          - target_label: __address__
+            replacement: blackbox:9115
+      - job_name: blackbox-tcp
+        metrics_path: /probe
+        params:
+          module: [tcp_connect]
+        static_configs:
+          - targets:
+%{for t in local.blackbox_tcp_targets~}
+              - "${t}"
+%{endfor~}
+        relabel_configs:
+          - source_labels: [__address__]
+            target_label: __param_target
+          - source_labels: [__param_target]
+            target_label: instance
+          - target_label: __address__
+            replacement: blackbox:9115
+      - job_name: blackbox-dns
+        metrics_path: /probe
+        params:
+          module: [dns_lab_internal]
+        static_configs:
+          - targets:
+%{for t in local.blackbox_dns_targets~}
+              - "${t}"
+%{endfor~}
+        relabel_configs:
+          - source_labels: [__address__]
+            target_label: __param_target
+          - source_labels: [__param_target]
+            target_label: instance
+          - target_label: __address__
+            replacement: blackbox:9115
+  YAML
+
+  # Uptime rules. probe_success==0 is the primary signal ("is it up"); the
+  # duration alert separately catches "responding but pathologically slow".
+  # `for` delays keep a single missed scrape or transient flap from paging you,
+  # and Alertmanager also routes on severity (critical=ntfy priority 5).
+  prometheus_alert_rules = <<-YAML
+    groups:
+      - name: uptime
+        rules:
+          - alert: EndpointDown
+            expr: probe_success == 0
+            for: 2m
+            labels:
+              severity: critical
+            annotations:
+              summary: "Endpoint down: {{ $labels.instance }}"
+              description: "{{ $labels.job }} probe of {{ $labels.instance }} has failed for 2 minutes."
+          - alert: EndpointSlow
+            expr: probe_duration_seconds > 5
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Endpoint slow: {{ $labels.instance }}"
+              description: "{{ $labels.instance }} is taking over 5s to respond (blackbox probe)."
+          # Watchdog: a permanently-firing alert so a broken alerting
+          # pipeline itself is visible (ntfy shows this firing whenever the
+          # stack is up; if it disappears, alerting is broken end-to-end).
+          - alert: Watchdog
+            expr: vector(1)
+            labels:
+              severity: info
+            annotations:
+              summary: "Watchdog (alerting pipeline alive)"
+  YAML
+
+  # Blackbox exporter modules. The dns module asks each CoreDNS instance for
+  # gitea.lab.internal and REQUIRES a valid answer -- this is what tells you
+  # "DNS is serving the zone", vs. tcp_connect which would pass on a half-dead
+  # coredns that accepts then drops queries.
+  blackbox_config = <<-YAML
+    modules:
+      http_2xx:
+        prober: http
+        timeout: 10s
+        http:
+          valid_http_versions: ["HTTP/1.1", "HTTP/2.0"]
+          follow_redirects: true
+          preferred_ip_protocol: ip4
+          # Trust the lab root CA: the exporter runs against the step-ca-
+          # issued certs on the per-VM Caddy front-ends, which the public
+          # PKI doesn't know.
+          tls_config:
+            ca_file: /etc/blackbox/root_ca.crt
+      tcp_connect:
+        prober: tcp
+        timeout: 5s
+      dns_lab_internal:
+        prober: dns
+        timeout: 5s
+        dns:
+          query_name: gitea.lab.internal
+          query_type: A
+          valid_rcodes: [NOERROR]
+          validate_answer_rrs:
+            fail_if_not_matches_regexp: [".*"]
+  YAML
+
+  # Alertmanager posts to the ntfy container by name over the shared podman
+  # user network (vmnet). The random topic is the only access control -- keep
+  # it in state like the other generated credentials. ntfy_priority 5 =
+  # "urgent" (phone makes sound/vibrates even on DND bypass if configured).
+  alertmanager_config = <<-YAML
+    route:
+      receiver: ntfy
+      group_by: [alertname, instance]
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 4h
+    receivers:
+      - name: ntfy
+        webhook_configs:
+          # Sends the whole alert-group JSON to the local shim (ntfy-shim:8901),
+          # which renders it into a clean ntfy publish (title + body + priority
+          # headers). Alertmanager's webhook_configs cannot format the message
+          # itself, and its http_config has no `headers` field (an earlier
+          # version set one and crash-looped Alertmanager on startup).
+          - url: "http://ntfy-shim:8901/alert"
+            send_resolved: true
+  YAML
+
+  # Tiny webhook->ntfy formatter. Alertmanager can only POST its alert-group
+  # JSON; this shim turns it into a readable ntfy publish with severity-mapped
+  # priority (what the raw-webhook path cannot do). Stdlib only, no deps.
+  ntfy_shim_py = <<-PY
+    import json, urllib.request
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    TOPIC = "${random_password.ntfy_alert_topic.result}"
+    NTFY = "http://ntfy/" + TOPIC
+    PRIORITY = {"critical": "5", "warning": "3"}
+    ICON = {"firing": "rotating_light", "resolved": "white_check_mark"}
+
+    class H(BaseHTTPRequestHandler):
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length", 0))
+            try:
+                g = json.loads(self.rfile.read(n) or b"{}")
+                alerts = g.get("alerts", [{}])
+                a = alerts[0]
+                status = g.get("status", "firing")
+                labels = a.get("labels", {})
+                ann = a.get("annotations", {})
+                name = labels.get("alertname", "Alert")
+                inst = labels.get("instance", "")
+                sev = labels.get("severity", "warning")
+                title = f"[{status.upper()}] {name}" + (f" - {inst}" if inst else "")
+                body = ann.get("description") or ann.get("summary") or name
+                if len(alerts) > 1:
+                    body += f" (+{len(alerts) - 1} more)"
+                req = urllib.request.Request(NTFY, data=body.encode(), headers={
+                    "Title": title,
+                    "Priority": PRIORITY.get(sev, "3"),
+                    "Tags": ICON.get(status, "bell"),
+                })
+                urllib.request.urlopen(req, timeout=10)
+                self.send_response(200)
+            except Exception as e:
+                self.send_response(500)
+            finally:
+                self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    HTTPServer(("0.0.0.0", 8901), H).serve_forever()
+  PY
+
+  # ntfy server. No auth: the topic is an un-guessable random string and the
+  # VM is LAN-private. base-url so the phone-app subscribe URL renders right.
+  ntfy_config = <<-YAML
+    base-url: "https://ntfy.${local.internal_domain}"
+    listen-http: ":80"
+    behind-proxy: true
   YAML
 
   grafana_datasource = <<-YAML
@@ -468,20 +711,31 @@ module "monitoring" {
   base_volume_path = libvirt_volume.base_vhost.path
   vcpu             = 4
   memory_mib       = 2048
-  disk_gib         = 20
-  bridge           = var.vhost_bridge
-  static_ip        = "${local.service_ips.monitoring}${var.vhost_lan_cidr_suffix}"
-  gateway          = var.vhost_gateway
-  dns              = local.vm_dns
-  firmware         = var.uefi_firmware
-  nvram_template   = var.uefi_nvram_template
-  vm_user          = var.vm_user
-  ssh_public_key   = trimspace(file(pathexpand(var.ssh_public_key_path)))
+  # Grew with the alerting stack (alertmanager + blackbox + ntfy); still small
+  # because nothing on this VM stores bulk data beyond prometheus-data.
+  disk_gib       = 25
+  bridge         = var.vhost_bridge
+  static_ip      = "${local.service_ips.monitoring}${var.vhost_lan_cidr_suffix}"
+  gateway        = var.vhost_gateway
+  dns            = local.vm_dns
+  firmware       = var.uefi_firmware
+  nvram_template = var.uefi_nvram_template
+  vm_user        = var.vm_user
+  ssh_public_key = trimspace(file(pathexpand(var.ssh_public_key_path)))
 
   extra_files = concat(
     [
       { path = "/etc/monitoring/prometheus.yml", content = local.prometheus_config },
+      { path = "/etc/monitoring/rules/uptime.yml", content = local.prometheus_alert_rules },
+      { path = "/etc/monitoring/alertmanager.yml", content = local.alertmanager_config },
+      { path = "/etc/monitoring/blackbox.yml", content = local.blackbox_config },
+      { path = "/etc/monitoring/ntfy-server.yml", content = local.ntfy_config },
+      { path = "/etc/monitoring/ntfy-shim.py", content = local.ntfy_shim_py, permissions = "0755" },
       { path = "/etc/monitoring/grafana-datasource.yml", content = local.grafana_datasource },
+      # The blackbox exporter needs the lab root CA to trust step-ca-issued
+      # TLS certs on the services it probes. Mounting the same file used for
+      # the OS trust store keeps it one source of truth.
+      { path = "/etc/monitoring/root_ca.crt", content = local.root_ca_cert_pem },
     ],
     local.caddy_extra_files.monitoring,
   )
@@ -496,10 +750,59 @@ module "monitoring" {
       name  = "prometheus"
       image = "docker.io/prom/prometheus:latest"
       ports = ["9090:9090"]
+      # --web.external-url keeps generated links right when browsing through
+      # caddy at https://prometheus.lab.internal (caddy strips no path, so a
+      # path prefix isn't needed; just the scheme/host).
+      command = "--config.file=/etc/prometheus/prometheus.yml --storage.tsdb.path=/prometheus --storage.tsdb.retention.time=30d --web.enable-lifecycle"
       volumes = [
         "/etc/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:Z",
+        "/etc/monitoring/rules:/etc/prometheus/rules:Z",
         "prometheus-data:/prometheus",
       ]
+    },
+    {
+      name       = "alertmanager"
+      image      = "docker.io/prom/alertmanager:latest"
+      ports      = ["9093:9093"]
+      depends_on = ["prometheus"]
+      volumes = [
+        "/etc/monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:Z",
+        "alertmanager-data:/alertmanager",
+      ]
+    },
+    {
+      name       = "blackbox"
+      image      = "quay.io/prometheus/blackbox-exporter:latest"
+      ports      = ["9115:9115"]
+      depends_on = ["prometheus"]
+      command    = "--config.file=/etc/blackbox/blackbox.yml"
+      volumes = [
+        "/etc/monitoring/blackbox.yml:/etc/blackbox/blackbox.yml:Z",
+        "/etc/monitoring/root_ca.crt:/etc/blackbox/root_ca.crt:Z",
+      ]
+    },
+    {
+      name  = "ntfy"
+      image = "docker.io/binwiederhier/ntfy:latest"
+      # Host port 8086: caddy reverse-proxies https://ntfy.lab.internal here so
+      # the phone app (with the lab root CA trusted) can subscribe from the LAN.
+      ports   = ["8086:80"]
+      command = "serve"
+      volumes = [
+        "/etc/monitoring/ntfy-server.yml:/etc/ntfy/server.yml:Z",
+        "ntfy-data:/var/cache/ntfy",
+      ]
+    },
+    {
+      # Alertmanager -> ntfy translator: turns the raw alert-group JSON into a
+      # readable publish (title + body + severity-mapped priority). Not exposed
+      # to the LAN; only needs to reach alertmanager's webhook and the ntfy
+      # container over the shared vmnet network.
+      name       = "ntfy-shim"
+      image      = "docker.io/library/python:3-alpine"
+      depends_on = ["ntfy"]
+      command    = "python /etc/monitoring/ntfy-shim.py"
+      volumes    = ["/etc/monitoring/ntfy-shim.py:/etc/monitoring/ntfy-shim.py:Z"]
     },
     {
       name  = "grafana"
@@ -518,7 +821,9 @@ module "monitoring" {
       name       = "caddy"
       image      = "docker.io/library/caddy:latest"
       ports      = ["80:80", "443:443"]
-      depends_on = ["grafana", "prometheus"]
+      depends_on = ["grafana", "prometheus", "ntfy"]
+      # Caddyfile now fronts ntfy too (local.caddy_sites.monitoring gains an
+      # ntfy entry so the phone app can subscribe via the step-ca cert).
       volumes = [
         "/etc/infra/Caddyfile:/etc/caddy/Caddyfile:Z",
         "/etc/infra/root_ca.crt:/etc/caddy/root_ca.crt:Z",
@@ -540,7 +845,7 @@ module "aspire" {
   base_volume_path = libvirt_volume.base_vhost.path
   vcpu             = 2
   memory_mib       = 2048
-  disk_gib         = 15
+  disk_gib         = 5
   bridge           = var.vhost_bridge
   static_ip        = "${local.service_ips.aspire}${var.vhost_lan_cidr_suffix}"
   gateway          = var.vhost_gateway
@@ -645,15 +950,18 @@ module "gitea" {
   base_volume_path = libvirt_volume.base_vhost.path
   vcpu             = 2
   memory_mib       = 4096
-  disk_gib         = 30
-  bridge           = var.vhost_bridge
-  static_ip        = "${local.service_ips.gitea}${var.vhost_lan_cidr_suffix}"
-  gateway          = var.vhost_gateway
-  dns              = local.vm_dns
-  firmware         = var.uefi_firmware
-  nvram_template   = var.uefi_nvram_template
-  vm_user          = var.vm_user
-  ssh_public_key   = trimspace(file(pathexpand(var.ssh_public_key_path)))
+  # Root disk holds only the OS + podman image layers; all repos/LFS live on
+  # the NFS export (/var/lib/gitea -> container /data) and the DB is on the
+  # shared postgres VM, so a small root disk is all the VM needs.
+  disk_gib       = 5
+  bridge         = var.vhost_bridge
+  static_ip      = "${local.service_ips.gitea}${var.vhost_lan_cidr_suffix}"
+  gateway        = var.vhost_gateway
+  dns            = local.vm_dns
+  firmware       = var.uefi_firmware
+  nvram_template = var.uefi_nvram_template
+  vm_user        = var.vm_user
+  ssh_public_key = trimspace(file(pathexpand(var.ssh_public_key_path)))
 
   # nfs-utils pulls in mount.nfs4 + rpc.statd needed for the fstab entry
   # below; the gitea container's data dir lives on the nfs VM.
@@ -667,7 +975,7 @@ module "gitea" {
         permissions = "0644"
         # x-systemd.before targets the quadlet-generated unit name (container
         # name + .service), i.e. gitea.service -- NOT podman-gitea.service.
-        content     = "${local.service_ips.nfs}:/gitea /var/lib/gitea nfs4 rw,hard,intr,noatime,_netdev,x-systemd.automount,x-systemd.idle-timeout=600,x-systemd.before=gitea.service 0 0\n"
+        content = "${local.service_ips.nfs}:/gitea /var/lib/gitea nfs4 rw,hard,intr,noatime,_netdev,x-systemd.automount,x-systemd.idle-timeout=600,x-systemd.before=gitea.service 0 0\n"
       },
     ],
     local.caddy_extra_files.gitea,

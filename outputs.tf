@@ -27,6 +27,14 @@ output "root_ca_pem" {
   value       = local.root_ca_cert_pem
 }
 
+# ntfy alert topic + URL: subscribe the ntfy phone app to
+# "https://ntfy.lab.internal/<ntfy_alert_topic>" to receive downt alerts.
+output "ntfy_alert_topic" {
+  description = "Random ntfy topic Alertmanager posts downtime alerts to (subscribe the phone app to https://ntfy.lab.internal/<this>)"
+  value       = random_password.ntfy_alert_topic.result
+  sensitive   = true
+}
+
 output "service_urls" {
   description = "HTTPS URLs for the web services (requires DNS pointed at the infra VM and the root CA trusted; nfs is not HTTP -- listed as its NFSv4 endpoint for completeness; dns/dns2 are the RFC 8484 DoH endpoints, not web UIs)"
   value = {
@@ -39,9 +47,11 @@ output "service_urls" {
     gitea      = "https://gitea.${local.internal_domain}"
     verdaccio  = "https://verdaccio.${local.internal_domain}"
     ca         = "https://ca.${local.internal_domain}:9000"
-    nfs        = "nfs://nfs.${local.internal_domain}/gitea"
-    dns        = "https://dns.${local.internal_domain}/dns-query"
-    dns2       = "https://dns2.${local.internal_domain}/dns-query"
+    # Phone-app subscribe URL: append the ntfy_alert_topic from outputs/secrets.
+    ntfy = "https://ntfy.${local.internal_domain}/<ntfy_alert_topic>"
+    nfs  = "nfs://nfs.${local.internal_domain}/gitea"
+    dns  = "https://dns.${local.internal_domain}/dns-query"
+    dns2 = "https://dns2.${local.internal_domain}/dns-query"
   }
 }
 
@@ -60,5 +70,6 @@ output "secrets" {
     gitea_internal_token     = random_password.gitea_internal_token.result
     gitea_secret_key         = random_password.gitea_secret_key.result
     gitea_jwt_secret         = random_password.gitea_jwt_secret.result
+    ntfy_alert_topic         = random_password.ntfy_alert_topic.result
   }
 }

@@ -19,7 +19,9 @@ import struct
 import sys
 import urllib.request
 
-LAB_CA = 'pki/root-ca-cert.pem'
+# The live trust anchor is the file-based root (see pki.tf); the old
+# pki/root-ca-cert.pem is the dead tfstate-era root, kept for reference only.
+LAB_CA = 'pki/root-ca.crt'
 DEFAULT_HOSTS = ('dns.lab.internal', 'dns2.lab.internal')
 DEFAULT_QNAME = 'gitea.lab.internal'
 QTYPE = 1  # A record
