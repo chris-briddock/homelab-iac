@@ -1,0 +1,13 @@
+# docker.io via the lab pull-through cache (the same registry VM the infra
+# services use — see services.tf 50-docker-mirror.conf). Docker falls back to
+# the real registry automatically when the mirror is unreachable.
+#
+# Install on the dev laptop:
+#   sudo mkdir -p /etc/docker/certs.d/docker.io
+#   sudo cp scripts/docker-mirror-hosts.toml /etc/docker/certs.d/docker.io/hosts.toml
+#   # containerd picks hosts.toml up live; a restart is harmless but not required:
+#   sudo systemctl restart docker
+server = "https://registry-1.docker.io"
+
+[host."https://registry.lab.internal"]
+  capabilities = ["pull", "resolve"]

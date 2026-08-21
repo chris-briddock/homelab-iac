@@ -54,3 +54,12 @@ resource "random_password" "gitea_jwt_secret" {
   length  = 48
   special = false
 }
+
+# Un-guessable ntfy alert topic (the "password" for who can see/post alerts
+# on the monitoring VM's ntfy instance). The topic path is what carries the
+# secret: ntfy has no auth in this setup, so anyone who can reach the topic
+# name can read it -- keep this as long/random as the service passwords.
+resource "random_password" "ntfy_alert_topic" {
+  length  = 40
+  special = false
+}

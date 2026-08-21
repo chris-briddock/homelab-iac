@@ -15,6 +15,7 @@ locals {
   dns_cname_records = {
     grafana    = "monitoring"
     prometheus = "monitoring"
+    ntfy       = "monitoring"
   }
 
   # Both CoreDNS VMs serve identical copies of the zone.
@@ -193,7 +194,7 @@ module "dns" {
   base_volume_path = libvirt_volume.base_vhost.path
   vcpu             = 2
   memory_mib       = 1024
-  disk_gib         = 15
+  disk_gib         = 5
   bridge           = var.vhost_bridge
   static_ip        = "${each.value}${var.vhost_lan_cidr_suffix}"
   gateway          = var.vhost_gateway
@@ -216,10 +217,10 @@ module "dns" {
   # caddy's step-ca ACME cert on :443).
   extra_runcmd = [
     ["openssl", "req", "-x509", "-nodes", "-newkey", "rsa:2048",
-     "-keyout", "/etc/infra/coredns/doh-tls.key",
-     "-out", "/etc/infra/coredns/doh-tls.crt",
-     "-days", "3650",
-     "-subj", "/CN=coredns"],
+      "-keyout", "/etc/infra/coredns/doh-tls.key",
+      "-out", "/etc/infra/coredns/doh-tls.crt",
+      "-days", "3650",
+    "-subj", "/CN=coredns"],
     ["chmod", "644", "/etc/infra/coredns/doh-tls.key", "/etc/infra/coredns/doh-tls.crt"],
   ]
 
@@ -261,8 +262,8 @@ module "dns" {
       # RFC 8484 /dns-query to the coredns container by container-name DNS
       # on the shared vmnet network. Plain :53/udp+tcp on coredns stays
       # published for LAN clients that haven't moved to DoH yet.
-      name       = "caddy"
-      image      = "docker.io/library/caddy:latest"
+      name  = "caddy"
+      image = "docker.io/library/caddy:latest"
       # :80 is required for ACME http-01 validation: step-ca reaches
       # http://<name>.lab.internal:80/.well-known/acme-challenge/... from the
       # ca VM. (Earlier attempts with only 443:443 published saw caddy log
@@ -302,7 +303,7 @@ module "ca" {
   base_volume_path = libvirt_volume.base_vhost.path
   vcpu             = 2
   memory_mib       = 1024
-  disk_gib         = 15
+  disk_gib         = 5
   bridge           = var.vhost_bridge
   static_ip        = "${local.service_ips.ca}${var.vhost_lan_cidr_suffix}"
   gateway          = var.vhost_gateway
@@ -315,10 +316,14 @@ module "ca" {
   extra_files = [
     { path = "/etc/infra/step/ca.json", content = local.step_ca_config },
     { path = "/etc/infra/step/root_ca.crt", content = local.root_ca_cert_pem },
-    { path = "/etc/infra/step/intermediate_ca.crt", content = tls_locally_signed_cert.intermediate.cert_pem },
+    # Intermediate CA is a local file minted by scripts/gen-pki.sh (see
+    # pki.tf); the key is git-ignored and lives only on the operator's
+    # machine -- `sensitive()` keeps parity with how the old tls provider
+    # attribute was marked, so the plan still redacts it.
+    { path = "/etc/infra/step/intermediate_ca.crt", content = file("${path.module}/pki/intermediate-ca.crt") },
     {
       path        = "/etc/infra/step/intermediate_ca_key"
-      content     = tls_private_key.intermediate.private_key_pem
+      content     = sensitive(file("${path.module}/pki/intermediate-ca.key"))
       permissions = "0600"
     },
     local.registry_mirror_file,

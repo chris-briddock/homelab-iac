@@ -29,3 +29,8 @@ override.tf.json
 # Ignore CLI configuration files
 .terraformrc
 terraform.rc
+
+# PKI private keys live ONLY on the operator's machine (minted once via
+# scripts/gen-pki.sh); certs (pki/*.crt) are committable.
+pki/*.key
+pki/*.srl
