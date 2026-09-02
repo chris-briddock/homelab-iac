@@ -55,6 +55,13 @@ resource "random_password" "gitea_jwt_secret" {
   special = false
 }
 
+# Shared Redis cache: AUTH password for the TLS-only listener (see the
+# redis module in services.tf).
+resource "random_password" "redis" {
+  length  = 32
+  special = false
+}
+
 # Un-guessable ntfy alert topic (the "password" for who can see/post alerts
 # on the monitoring VM's ntfy instance). The topic path is what carries the
 # secret: ntfy has no auth in this setup, so anyone who can reach the topic

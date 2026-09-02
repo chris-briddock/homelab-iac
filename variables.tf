@@ -13,6 +13,16 @@ variable "tf_encryption_passphrase" {
   sensitive   = true
 }
 
+# Not a random_password: Gitea mints this token (Site Administration ->
+# Actions -> Runners -> Create new runner, on https://gitea.lab.internal)
+# and it must be pasted here out-of-band. Supply via
+# TF_VAR_gitea_runner_registration_token; never commit it.
+variable "gitea_runner_registration_token" {
+  description = "Gitea Actions runner registration token, minted in the Gitea admin UI and supplied via TF_VAR_gitea_runner_registration_token"
+  type        = string
+  sensitive   = true
+}
+
 variable "pool_name" {
   description = "Name of the libvirt storage pool used for VM disks"
   type        = string

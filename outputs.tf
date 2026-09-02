@@ -6,19 +6,23 @@ output "vm_ips" {
 output "service_ips" {
   description = "IPv4 addresses of the real services on the vhost (bridged LAN, DHCP-assigned)"
   value = {
-    surrealdb  = module.surrealdb.ipv4
-    postgres   = module.postgres.ipv4
-    qvault     = module.qvault.ipv4
-    penpot     = module.penpot.ipv4
-    monitoring = module.monitoring.ipv4
-    aspire     = module.aspire.ipv4
-    dns        = module.dns["dns"].ipv4
-    dns2       = module.dns["dns2"].ipv4
-    ca         = module.ca.ipv4
-    registry   = module.registry.ipv4
-    gitea      = module.gitea.ipv4
-    verdaccio  = module.verdaccio.ipv4
-    nfs        = module.nfs.ipv4
+    surrealdb      = module.surrealdb.ipv4
+    postgres       = module.postgres.ipv4
+    qvault         = module.qvault.ipv4
+    penpot         = module.penpot.ipv4
+    monitoring     = module.monitoring.ipv4
+    aspire         = module.aspire.ipv4
+    dns-lb         = module.dns_lb.ipv4
+    dns1           = module.dns["dns1"].ipv4
+    dns2           = module.dns["dns2"].ipv4
+    ca             = module.ca.ipv4
+    registry       = module.registry.ipv4
+    gitea          = module.gitea.ipv4
+    verdaccio      = module.verdaccio.ipv4
+    nfs            = module.nfs.ipv4
+    redis          = module.redis.ipv4
+    gitea-runner-1 = module.gitea_runner["gitea-runner-1"].ipv4
+    gitea-runner-2 = module.gitea_runner["gitea-runner-2"].ipv4
   }
 }
 
@@ -50,9 +54,21 @@ output "service_urls" {
     # Phone-app subscribe URL: append the ntfy_alert_topic from outputs/secrets.
     ntfy = "https://ntfy.${local.internal_domain}/<ntfy_alert_topic>"
     nfs  = "nfs://nfs.${local.internal_domain}/gitea"
-    dns  = "https://dns.${local.internal_domain}/dns-query"
-    dns2 = "https://dns2.${local.internal_domain}/dns-query"
+    # rediss:// = Redis over TLS (self-signed server cert; pin it or skip
+    # verification on the LAN). Password via `tofu output -json secrets`.
+    redis = "rediss://redis.${local.internal_domain}:6379"
+    dns   = "https://dns.${local.internal_domain}/dns-query"
+    dns2  = "https://dns2.${local.internal_domain}/dns-query"
   }
+}
+
+# Convenience output for state recovery: the postgres password is also the
+# tofu state backend password (PG_CONN_STR). Sensitive so it's not printed
+# in plain text by `tofu output` without `-raw`.
+output "postgres_password" {
+  description = "Postgres superuser password (also the tofu state backend password — used in PG_CONN_STR)"
+  value       = random_password.postgres.result
+  sensitive   = true
 }
 
 output "secrets" {
@@ -71,5 +87,6 @@ output "secrets" {
     gitea_secret_key         = random_password.gitea_secret_key.result
     gitea_jwt_secret         = random_password.gitea_jwt_secret.result
     ntfy_alert_topic         = random_password.ntfy_alert_topic.result
+    redis_password           = random_password.redis.result
   }
 }

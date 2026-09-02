@@ -8,6 +8,12 @@ ethernets:
       - to: default
         via: ${gateway}
     nameservers:
+      # All servers here (internal LB + public fallback). systemd-resolved
+      # would normally treat them as equal and sometimes accept a public
+      # NXDOMAIN for lab.internal as final; a resolved drop-in in
+      # user-data.yaml.tmpl re-marks the public entry as a low-priority
+      # catch-all (~.) so it is only used for names the internal DNS doesn't
+      # claim. netplan has no syntax for that split, so the drop-in owns it.
       addresses: [${join(", ", dns)}]
 %{ else ~}
     dhcp4: true

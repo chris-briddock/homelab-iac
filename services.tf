@@ -6,13 +6,30 @@ locals {
     penpot     = "192.168.70.13"
     monitoring = "192.168.70.14"
     aspire     = "192.168.70.15"
-    dns        = "192.168.70.16"
-    registry   = "192.168.70.17"
-    ca         = "192.168.70.18"
-    dns2       = "192.168.70.19"
-    gitea      = "192.168.70.20"
-    verdaccio  = "192.168.70.21"
-    nfs        = "192.168.70.22"
+    # dns1/dns2 are the two CoreDNS backends (were dns/dns2). dns.lab.internal
+    # is now the load-balancer in front of them (see infra.tf module dns_lb);
+    # the dns1 backend is CNAME'd from the old `dns` name for DoH back-compat.
+    dns1      = "192.168.70.16"
+    registry  = "192.168.70.17"
+    ca        = "192.168.70.18"
+    dns2      = "192.168.70.19"
+    gitea     = "192.168.70.20"
+    verdaccio = "192.168.70.21"
+    nfs       = "192.168.70.22"
+    redis     = "192.168.70.23"
+    # The DNS load balancer (dns.lb / dns-lb VM). dns.lab.internal is a CNAME
+    # to it (infra.tf dns_cname_records) so the dns.lab.internal name the rest
+    # of the stack references resolves to this IP.
+    dns-lb = "192.168.70.26"
+  }
+
+  # Gitea Actions runner executor VMs. Nested in service_ips would force
+  # every consumer (DNS A-records, caddyfiles, prometheus config, vhost
+  # client lists) to handle a mixed scalar/map type, so these live in a
+  # separate map; dns_a_records in infra.tf merges both.
+  gitea_runner_ips = {
+    gitea-runner-1 = "192.168.70.24"
+    gitea-runner-2 = "192.168.70.25"
   }
 
   # Shared by penpot-backend (enforcement) and penpot-frontend (UI rendering
@@ -21,12 +38,111 @@ locals {
   # self-registration to complete.
   penpot_flags = "enable-registration enable-login-with-password disable-email-verification"
 
-  # Service VMs resolve ONLY through the internal CoreDNS instances (which
-  # forward public names upstream). Both are authoritative for lab.internal,
-  # so either may answer any query. Never add a public fallback here:
-  # systemd-resolved treats all servers as equivalent and accepts a public
-  # server's NXDOMAIN for lab.internal as final.
-  vm_dns = [local.service_ips.dns, local.service_ips.dns2]
+  # Caching mirrors baked into the daemon-based Gitea runners (module
+  # gitea_runner below). Docker-hub pulls by CI jobs go through the
+  # registry VM's pull-through cache; apk/apt fetch through the vm/cache
+  # apt-cacher-ng on the vhost. Job containers do NOT share the host's
+  # cloud-init config (each job gets a fresh container), so these have to
+  # live in the runner daemon's own config file.
+  runner_registry_mirrors = ["https://registry.${local.internal_domain}"]
+  runner_apt_proxy        = "http://192.168.70.1:3142"
+
+  # Per-VM act_runner config. cache.host_workdir_parent is REQUIRED in daemon
+  # mode: the runner creates a per-job workdir under it on the VM and
+  # bind-mounts the SAME host path into every job container, so the job sees
+  # a consistent checkout path. (Without it, docker.ValidVolumes would have
+  # to whitelist an ever-changing tmpdir.)
+  act_runner_config = {
+    for name, ip in local.gitea_runner_ips : name => yamlencode({
+      log = { level = "info" }
+      runner = {
+        file           = ".runner"
+        capacity       = 4
+        timeout        = "3h"
+        insecure       = false
+        fetch_timeout  = "10s"
+        fetch_interval = "2s"
+        # ubuntu-latest resolves to the node image below; default is empty
+        # (jobs must then pin container.image explicitly).
+        labels = [
+          "ubuntu-latest:docker://docker.io/library/node:24",
+          "ubuntu-24.04:docker://docker.io/library/node:24",
+        ]
+      }
+      cache = {
+        enabled             = true
+        dir                 = "/data/cache"
+        host_workdir_parent = "/data/workdirs"
+      }
+      container = {
+        # Total isolation: no socket/exec forwarding from job containers to
+        # the daemon. Jobs that need docker-in-docker won't work -- use a
+        # service container with the dind image instead.
+        privileged = false
+        # Bind the lab CA bundle (root + intermediate, written by cloud-init
+        # on the runner VM) into every job container read-only. Job images
+        # (e.g. node:24 for actions/checkout) trust only public CAs by
+        # default, so `git fetch https://gitea.lab.internal/...` failed with
+        # "certificate signed by unknown authority". The *_CAINFO /
+        # *_CA_CERTS env vars below point each runtime at this file.
+        # ":Z" is required on SELinux hosts: without it podman mounts the
+        # host file with a label the container can't read and git's libcurl
+        # fails with "Problem with the SSL CA cert (path? access rights?)".
+        options        = "-v /var/lib/act_runner/ca/lab-ca-bundle.crt:/etc/ssl/certs/lab-ca-bundle.crt:ro,Z"
+        workdir_parent = null
+        valid_volumes  = []
+        docker_host    = "-"
+        force_pull     = true
+        # Job containers run on the runner's default podman network. A
+        # dedicated runnernet was dropped: the act_runner container is
+        # ROOTFUL (needed for the podman.sock Docker API) while the vm
+        # module's quadlet .network files create ROOTLESS networks for the
+        # unprivileged user -- rootful podman cannot see them, so any
+        # explicit --network <name> fails with "network not found".
+        # Blank string = let the daemon inherit, which lands jobs on the
+        # same rootful bridge the runner itself uses.
+        network_mode = ""
+        # Overrides the built-in gitea/runner-images default. The registry
+        # mirror's CA + an apt proxy are baked in so pull/build inside CI
+        # jobs works without per-repo hacking. The *_CAINFO / *_CAINFO_BUNDLE
+        # vars make the common TLS clients in job containers (git's libcurl,
+        # Node's boringssl, curl, python-requests, Go) trust the lab root +
+        # intermediate CA mounted at the path in `options` above.
+        envs = {
+          DOCKER_REGISTRY_MIRRORS = join(",", local.runner_registry_mirrors)
+          # Insecure-registries: job-local dockerd (dind service containers)
+          # can't be pushed config files, so allow-plainhttp to the lab's
+          # own CAs-covered HTTPS cache stays permissive at the daemon level.
+          DOCKER_INSECURE_REGISTRIES = "192.168.70.0/22"
+          APT_PROXY                  = local.runner_apt_proxy
+          # git (libcurl backend) -- used by actions/checkout's `git fetch`.
+          GIT_SSL_CAINFO = "/etc/ssl/certs/lab-ca-bundle.crt"
+          # Node.js TLS (actions themselves run on node; checkout.js, etc).
+          NODE_EXTRA_CA_CERTS = "/etc/ssl/certs/lab-ca-bundle.crt"
+          # curl CLI + python-requests, for ad-hoc HTTPS in job steps.
+          CURL_CA_BUNDLE     = "/etc/ssl/certs/lab-ca-bundle.crt"
+          REQUESTS_CA_BUNDLE = "/etc/ssl/certs/lab-ca-bundle.crt"
+          # Go-based tools built inside jobs default to the system store;
+          # SSL_CERT_FILE overrides it (Go prefers this over the OS path).
+          SSL_CERT_FILE = "/etc/ssl/certs/lab-ca-bundle.crt"
+        }
+      }
+      host = { workdir_parent = null }
+    })
+  }
+
+  # Service VMs resolve through the DNS load balancer (dns.lab.internal =
+  # 192.168.70.26, round-robins the two CoreDNS backends) with 1.1.1.1 as a
+  # catastrophe fallback for when the whole internal DNS stack is down.
+  #
+  # The public fallback is NOT just another nameserver: systemd-resolved would
+  # treat equally-weighted per-link servers as interchangeable and sometimes
+  # accept a public NXDOMAIN for lab.internal as final. The network-config
+  # template writes all of vm_dns into netplan (it can't express split-DNS),
+  # and the resolved drop-in in user-data.yaml.tmpl re-marks 1.1.1.1 as a
+  # low-priority catch-all (~.) so it's only queried for names the internal
+  # LB doesn't claim.
+  vm_dns = [local.service_ips.dns-lb, "1.1.1.1"]
 
   # The PKI is file-based now (see pki.tf): scripts/gen-pki.sh minted the
   # root + intermediate CA as local files, with private keys git-ignored and
@@ -44,9 +160,10 @@ locals {
     # the step-ca cert (the LAN already trusts the lab root CA).
     monitoring = { grafana = "grafana:3000", prometheus = "prometheus:9090", ntfy = "ntfy:80" }
     aspire     = { aspire = "aspire-dashboard:18888" }
-    registry   = { registry = "registry:5000" }
-    gitea      = { gitea = "gitea:3000" }
-    verdaccio  = { verdaccio = "verdaccio:4873" }
+    # registry is NOT here: it has a custom Caddyfile (registry_caddyfile)
+    # with path-routing to multiple backend instances (writable + 4 caches).
+    gitea     = { gitea = "gitea:3000" }
+    verdaccio = { verdaccio = "verdaccio:4873" }
   }
 
   # The tls issuer must be set explicitly per site: Caddy classifies
@@ -86,20 +203,146 @@ locals {
     content = local.root_ca_cert_pem
   }
 
-  # docker.io pulls go through the cache on the registry VM (TLS via its
-  # Caddy); podman falls back to docker.io directly if the mirror is
-  # unreachable.
+  # Intermediate CA cert, written to the VM for containers that must trust the
+  # step-ca-issued leaf certs (gitea's Caddy presents a cert signed by this
+  # intermediate; the root anchor alone is sufficient for OS-level validation
+  # because the root signs the intermediate, but shipping the intermediate too
+  # lets container images without a root-only bundle path validate directly).
+  intermediate_ca_cert_pem = file("${path.module}/pki/intermediate-ca.crt")
+
+  # Combined root + intermediate bundle. CI job containers (node:24 etc.) are
+  # pointed at this single file via GIT_SSL_CAINFO / NODE_EXTRA_CA_CERTS /
+  # *_CA_BUNDLE; a one-file bundle works for every TLS client without needing
+  # each image's update-ca-certificates (several of which don't ship it).
+  lab_ca_bundle_pem = "${local.root_ca_cert_pem}\n${local.intermediate_ca_cert_pem}"
+
+  # All four upstream registries the fleet uses are mirrored through the
+  # registry VM's pull-through caches (TLS via its Caddy). podman falls back
+  # to the upstream directly if a mirror is unreachable. Sharing one client
+  # identity (the registry VM) across the fleet avoids per-VM anonymous
+  # rate-limits (which took dns2's coredns down on 2026-09-01). The mirror
+  # paths match the Caddyfile path-routing in registry_caddyfile below.
   registry_mirror_file = {
-    path    = "/etc/containers/registries.conf.d/50-docker-mirror.conf"
+    path    = "/etc/containers/registries.conf.d/50-registry-mirrors.conf"
     content = <<-EOT
       [[registry]]
       prefix = "docker.io"
       location = "docker.io"
 
       [[registry.mirror]]
-      location = "registry.${local.internal_domain}"
+      location = "registry.${local.internal_domain}/docker.io"
+
+      [[registry]]
+      prefix = "quay.io"
+      location = "quay.io"
+
+      [[registry.mirror]]
+      location = "registry.${local.internal_domain}/quay.io"
+
+      [[registry]]
+      prefix = "ghcr.io"
+      location = "ghcr.io"
+
+      [[registry.mirror]]
+      location = "registry.${local.internal_domain}/ghcr.io"
+
+      [[registry]]
+      prefix = "mcr.microsoft.com"
+      location = "mcr.microsoft.com"
+
+      [[registry.mirror]]
+      location = "registry.${local.internal_domain}/mcr.microsoft.com"
     EOT
   }
+
+  # Distribution registry config for the WRITABLE instance (:5000). This hosts
+  # custom/lab-built images and is pushable. No `proxy` block = not a cache.
+  # delete.enabled=true so stale custom tags can be pruned.
+  registry_config = <<-YAML
+    version: 0.1
+    log:
+      level: info
+    storage:
+      cache:
+        blobdescriptor: inmemory
+      filesystem:
+        rootdirectory: /var/lib/registry/local
+      delete:
+        enabled: true
+    http:
+      addr: :5000
+      headers:
+        X-Content-Type-Options: [nosniff]
+  YAML
+
+  # Pull-through cache configs: one distribution instance per upstream, each on
+  # its own port with its own storage subdir. The `proxy.remoteurl` block is
+  # what turns a plain registry into a pull-through cache for that single
+  # upstream (and makes it read-only — which is why pushes go to :5000 above,
+  # not to a cache instance). delete.enabled=false on caches (a mirror, not a
+  # store).
+  registry_cache_configs = {
+    "docker.io"         = { port = 5001, url = "https://registry-1.docker.io" }
+    "quay.io"           = { port = 5002, url = "https://quay.io" }
+    "ghcr.io"           = { port = 5003, url = "https://ghcr.io" }
+    "mcr.microsoft.com" = { port = 5004, url = "https://mcr.microsoft.com" }
+  }
+
+  registry_cache_files = {
+    for name, cfg in local.registry_cache_configs : name => {
+      path    = "/etc/infra/registry/${name}.yml"
+      content = <<-YAML
+        version: 0.1
+        log:
+          level: info
+        storage:
+          cache:
+            blobdescriptor: inmemory
+          filesystem:
+            rootdirectory: /var/lib/registry/${name}
+          delete:
+            enabled: false
+        http:
+          addr: :${cfg.port}
+          headers:
+            X-Content-Type-Options: [nosniff]
+        proxy:
+          remoteurl: ${cfg.url}
+      YAML
+    }
+  }
+
+  # Custom Caddyfile for the registry VM. Unlike the other caddy-fronted VMs
+  # (which use caddy_sites -> a single reverse_proxy), the registry needs
+  # PATH-based routing: /docker.io/* -> :5001, /quay.io/* -> :5002, etc., and
+  # everything else (custom images) -> :5000. The path prefix is stripped
+  # before proxying so the cache instance sees the normal /v2/<repo> path. TLS
+  # via step-ca ACME, same as every other caddy VM.
+  registry_caddyfile = <<-EOT
+    registry.${local.internal_domain} {
+        handle_path /docker.io/* {
+            reverse_proxy registry-cache-docker:5001
+        }
+        handle_path /quay.io/* {
+            reverse_proxy registry-cache-quay:5002
+        }
+        handle_path /ghcr.io/* {
+            reverse_proxy registry-cache-ghcr:5003
+        }
+        handle_path /mcr.microsoft.com/* {
+            reverse_proxy registry-cache-mcr:5004
+        }
+        handle {
+            reverse_proxy registry:5000
+        }
+        tls {
+            issuer acme {
+                dir https://ca.${local.internal_domain}:9000/acme/acme/directory
+                trusted_roots /etc/caddy/root_ca.crt
+            }
+        }
+    }
+  EOT
 }
 
 # 0.9.x: libvirt pools cannot be updated in-place — any change forces
@@ -224,6 +467,15 @@ module "postgres" {
 
   extra_files = [local.registry_mirror_file, local.root_ca_anchor_file]
 
+  # Create the tofu state backend (tofu_state DB + tofu role) on first boot.
+  # This runs after the postgres container starts (cloud-init write_files +
+  # runcmd order). The password is the same as POSTGRES_PASSWORD for simplicity
+  # — the operator sets PG_CONN_STR to match. Idempotent: CREATE ROLE IF NOT
+  # EXISTS and CREATE DATABASE IF NOT EXISTS.
+  extra_runcmd = [
+    ["bash", "-c", "until podman exec postgres psql -U postgres -c 'SELECT 1' >/dev/null 2>&1; do sleep 2; done; podman exec postgres psql -U postgres -v ON_ERROR_STOP=1 -c \"CREATE ROLE tofu LOGIN PASSWORD '${random_password.postgres.result}'\" || podman exec postgres psql -U postgres -v ON_ERROR_STOP=1 -c \"ALTER ROLE tofu WITH LOGIN PASSWORD '${random_password.postgres.result}'\"; podman exec postgres psql -U postgres -v ON_ERROR_STOP=1 -c 'CREATE DATABASE tofu_state OWNER tofu' || true; podman exec postgres psql -U postgres -v ON_ERROR_STOP=1 -c 'GRANT ALL ON DATABASE tofu_state TO tofu'"],
+  ]
+
   containers = [
     {
       name  = "postgres"
@@ -242,6 +494,245 @@ module "postgres" {
       environment = {
         DATA_SOURCE_NAME = "postgresql://postgres:${random_password.postgres.result}@postgres:5432/postgres?sslmode=disable"
       }
+    },
+    {
+      name  = "node-exporter"
+      image = "quay.io/prometheus/node-exporter:latest"
+      ports = ["9100:9100"]
+    },
+  ]
+}
+
+# ---------------------------------------------------------------------------
+# Redis: shared cache for lab services. TLS-only: the plaintext listener is
+# disabled (`port 0`) and 6379 speaks TLS with a self-signed cert minted at
+# first boot (same pattern as the CoreDNS DoH listener in infra.tf -- no
+# tofu-readable CA key exists to sign with, so clients either pin this cert
+# as their CA bundle or skip verification on the private LAN). AUTH via a
+# random password is still required on top of TLS.
+# ---------------------------------------------------------------------------
+locals {
+  redis_conf = <<-EOT
+    # No plaintext listener: TLS is the only way in.
+    port 0
+    tls-port 6379
+    bind 0.0.0.0
+    protected-mode yes
+
+    tls-cert-file /etc/redis/tls/redis.crt
+    tls-key-file /etc/redis/tls/redis.key
+    # Clients authenticate by password, not client certs.
+    tls-auth-clients no
+
+    requirepass ${random_password.redis.result}
+
+    # Treat this as a cache, not a store: bounded memory, LRU eviction, and
+    # no persistence -- losing the dataset on rebuild is by design.
+    maxmemory 512mb
+    maxmemory-policy allkeys-lru
+    appendonly no
+    save ""
+  EOT
+}
+
+module "redis" {
+  source    = "./modules/vm"
+  providers = { libvirt = libvirt.vhost }
+
+  name             = "redis-vm"
+  pool_name        = libvirt_pool.vhost.name
+  base_volume_path = libvirt_volume.base_vhost.path
+  vcpu             = 2
+  memory_mib       = 1024
+  disk_gib         = 5
+  bridge           = var.vhost_bridge
+  static_ip        = "${local.service_ips.redis}${var.vhost_lan_cidr_suffix}"
+  gateway          = var.vhost_gateway
+  dns              = local.vm_dns
+  firmware         = var.uefi_firmware
+  nvram_template   = var.uefi_nvram_template
+  vm_user          = var.vm_user
+  ssh_public_key   = trimspace(file(pathexpand(var.ssh_public_key_path)))
+
+  extra_files = [
+    { path = "/etc/infra/redis/redis.conf", content = local.redis_conf },
+    local.registry_mirror_file,
+    local.root_ca_anchor_file,
+  ]
+
+  # Self-signed server cert, minted once at first boot. Mode 0644 on the key
+  # because the redis container runs as the unprivileged redis uid; the cert
+  # is a LAN-internal encryption hop, not the trust boundary (AUTH is).
+  extra_runcmd = [
+    ["mkdir", "-p", "/etc/infra/redis/tls"],
+    ["openssl", "req", "-x509", "-nodes", "-newkey", "rsa:2048",
+      "-keyout", "/etc/infra/redis/tls/redis.key",
+      "-out", "/etc/infra/redis/tls/redis.crt",
+      "-days", "3650",
+      "-subj", "/CN=redis.${local.internal_domain}",
+    "-addext", "subjectAltName=DNS:redis.${local.internal_domain},IP:${local.service_ips.redis}"],
+    ["chmod", "644", "/etc/infra/redis/tls/redis.key", "/etc/infra/redis/tls/redis.crt"],
+  ]
+
+  containers = [
+    {
+      name    = "redis"
+      image   = "docker.io/library/redis:7"
+      ports   = ["6379:6379"]
+      command = "redis-server /etc/redis/redis.conf"
+      volumes = [
+        "/etc/infra/redis/redis.conf:/etc/redis/redis.conf:Z",
+        "/etc/infra/redis/tls:/etc/redis/tls:Z",
+      ]
+    },
+    {
+      name       = "redis-exporter"
+      image      = "quay.io/oliver006/redis_exporter:latest"
+      ports      = ["9121:9121"]
+      depends_on = ["redis"]
+      # rediss:// = TLS to the sibling container over the podman network;
+      # the server cert is self-signed so verification is skipped. The
+      # exporter reads REDIS_PASSWORD straight from the environment.
+      command = "--redis.addr=rediss://redis:6379 --skip-tls-verification"
+      environment = {
+        REDIS_PASSWORD = random_password.redis.result
+      }
+    },
+    {
+      name  = "node-exporter"
+      image = "quay.io/prometheus/node-exporter:latest"
+      ports = ["9100:9100"]
+    },
+  ]
+}
+
+# ---------------------------------------------------------------------------
+# Gitea Actions runners: two isolated executor VMs, each running an
+# act_runner daemon that polls https://gitea.lab.internal for jobs and
+# executes them in per-job podman containers. The registration token is NOT
+# generated here (it's minted by Gitea in the admin UI and passed out-of-band
+# via TF_VAR_gitea_runner_registration_token -- see variables.tf).
+#
+# The podman.socket is exposed to the act_runner container on a dedicated
+# bridge network so the daemon can spawn sibling job containers on the VM;
+# jobs themselves are started on the same spawned-from-daemon layer and are
+# therefore structurally isolated from the runner daemon. Rootless podman
+# (used by all other services) is NOT usable here: act_runner speaks the
+# Docker API and needs the syscall/interprocess freedom rootful gives it.
+# ---------------------------------------------------------------------------
+module "gitea_runner" {
+  source    = "./modules/vm"
+  providers = { libvirt = libvirt.vhost }
+
+  for_each = local.gitea_runner_ips
+
+  name             = "${each.key}-vm"
+  pool_name        = libvirt_pool.vhost.name
+  base_volume_path = libvirt_volume.base_vhost.path
+  vcpu             = 20
+  memory_mib       = 4096
+  disk_gib         = 20
+  bridge           = var.vhost_bridge
+  static_ip        = "${each.value}${var.vhost_lan_cidr_suffix}"
+  gateway          = var.vhost_gateway
+  dns              = local.vm_dns
+  firmware         = var.uefi_firmware
+  nvram_template   = var.uefi_nvram_template
+  vm_user          = var.vm_user
+  ssh_public_key   = trimspace(file(pathexpand(var.ssh_public_key_path)))
+
+  extra_files = [
+    { path = "/etc/infra/act_runner/config.yaml", content = local.act_runner_config[each.key] },
+    local.registry_mirror_file,
+    local.root_ca_anchor_file,
+    # Combined root+intermediate bundle at the host path bind-mounted into
+    # every CI job container (see local.act_runner_config container.options).
+    { path = "/var/lib/act_runner/ca/lab-ca-bundle.crt", content = local.lab_ca_bundle_pem },
+    # Intermediate CA written next to the root anchor so the act-runner
+    # container can mount both into its Debian-style CA directory. Gitea's
+    # Caddy presents a leaf cert signed by this intermediate; act_runner
+    # (Go) needs the chain in its trust bundle to verify it.
+    {
+      path    = "/etc/infra/ca/lab-internal-intermediate-ca.crt"
+      content = local.intermediate_ca_cert_pem
+    },
+  ]
+
+  # Rootful podman.socket provides the Docker API act_runner uses to spawn
+  # job containers. The quadlets themselves are generated per-container by
+  # cloud-init (vm module) as rootless -- that is podman's default unit
+  # target. The socket unit is the only rootful moving part.
+  extra_runcmd = [
+    ["systemctl", "enable", "--now", "podman.socket"],
+    # act_runner spawns jobs by bind-mounting a workdir from the *host*
+    # (see container.options); pre-create it with _netdev-less tmpfs-free
+    # perms so a fresh VM has a stable parent for job containers.
+    ["mkdir", "-p", "/var/lib/act_runner/workdirs", "/var/lib/act_runner/cache", "/var/lib/act_runner/ca"],
+  ]
+
+  containers = [
+    {
+      name = "act-runner"
+      # Pinned x.y.z tag -- gitea/act_runner publishes only x.y.z + latest on
+      # Docker Hub (there is no floating "0.2" major tag; pulling it 404s
+      # with manifest unknown). Version must satisfy the Gitea server's
+      # minimum runner version (Gitea 1.x requires act_runner >= 0.2.x).
+      image = "docker.io/gitea/act_runner:0.2.13"
+      # The gitea/act_runner image's ENTRYPOINT is `/sbin/tini -- run.sh`,
+      # and run.sh ignores any CMD/Exec= args (it runs `act_runner daemon`
+      # directly). To run a custom startup script we MUST override the
+      # entrypoint to `sh`; the command below then runs as `sh -c '...'`.
+      # Without this override the `cat`/`register` half of the command was
+      # silently skipped and the daemon ran with no CA bundle, failing with
+      # "tls: failed to verify certificate: x509: certificate signed by
+      # unknown authority".
+      entrypoint = "sh"
+      # Registration happens once against the local .runner state file on
+      # the named volume; re-running `register` on an existing file is a
+      # no-op (the runner just validates and proceeds to `daemon`).
+      # The gitea/act_runner image ships no update-ca-certificates (it's a
+      # distroless-ish Alpine build), so the bundle isn't rebuilt by a trust
+      # tool. Instead the command concatenates the image's existing public
+      # CA bundle with the two lab certs mounted below into a single file,
+      # and SSL_CERT_FILE points Go's crypto/x509 pool at it (Go reads
+      # SSL_CERT_FILE in preference to the OS default). This was verified
+      # working: with the lab root+intermediate appended, `act_runner
+      # register` reports "Successfully pinged the Gitea instance server"
+      # + "Runner registered successfully". Without it the error was
+      # "tls: failed to verify certificate: x509: certificate signed by
+      # unknown authority".
+      command = "-c 'cat /etc/ssl/certs/ca-certificates.crt /usr/local/share/ca-certificates/lab-internal-root-ca.crt /usr/local/share/ca-certificates/lab-internal-intermediate-ca.crt > /tmp/lab-ca-bundle.crt; act_runner register --no-interactive --instance https://gitea.${local.internal_domain} --token ${var.gitea_runner_registration_token} --name ${each.key} --labels ubuntu-latest:docker://docker.io/library/node:24 --config /etc/act_runner/config.yaml || true; exec act_runner daemon --config /etc/act_runner/config.yaml'"
+      environment = {
+        CONFIG_FILE   = "/etc/act_runner/config.yaml"
+        SSL_CERT_FILE = "/tmp/lab-ca-bundle.crt"
+      }
+      volumes = [
+        "/etc/infra/act_runner/config.yaml:/etc/act_runner/config.yaml:Z",
+        # Job containers bind-mount these host paths (the podman socket is
+        # rootful, so path translation from the container's /data to the
+        # host happens one level up in act_runner's DOCKER_HOST client).
+        "/var/lib/act_runner/workdirs:/data/workdirs:Z",
+        "/var/lib/act_runner/cache:/data/cache:Z",
+        "act-runner-data:/data",
+        # Lab root + intermediate CAs into the container; the command above
+        # concatenates them with the image's public CA bundle into
+        # /tmp/lab-ca-bundle.crt (the image has no update-ca-certificates).
+        "/etc/pki/ca-trust/source/anchors/lab-internal-root-ca.crt:/usr/local/share/ca-certificates/lab-internal-root-ca.crt:Z",
+        "/etc/infra/ca/lab-internal-intermediate-ca.crt:/usr/local/share/ca-certificates/lab-internal-intermediate-ca.crt:Z",
+      ]
+      # Rootful podman's Docker-compatible socket; act_runner speaks the
+      # Docker API and this lets it spawn sibling job containers on the VM.
+      # --privileged + the socket are the documented act_runner pattern:
+      # without the socket the daemon has nothing to run jobs on; without
+      # --privileged job containers that run apt/apk (CAP_NET_ADMIN,
+      # setcap) abort. No --network override (see network_mode note in
+      # local.act_runner_config): the container stays on the generated
+      # quadlet's Network=... which is fine since the daemon is rootful
+      # and rootful podman owns its own network namespace list.
+      extra_args = [
+        "-v /run/podman/podman.sock:/var/run/docker.sock:Z",
+        "--privileged",
+      ]
     },
     {
       name  = "node-exporter"
@@ -429,6 +920,24 @@ locals {
     "https://registry.${local.internal_domain}/v2/", # 200 from the registry root means docker.io cache is serving
     "https://gitea.${local.internal_domain}",
     "https://verdaccio.${local.internal_domain}",
+    # DoH load-balancer endpoint: https://dns.lab.internal/dns-query fronts
+    # dns1/dns2 via L4 TLS passthrough on dns-lb (:443). A 200 from the DoH
+    # endpoint means the full chain works: LB -> backend caddy (TLS) ->
+    # coredns:8053. Probing the bare path returns 404 (caddy's catch-all); the
+    # ?dns= param makes blackbox do a real DoH query (HTTP GET with dns
+    # parameter per RFC 8484).
+    #
+    # The ?dns= base64 MUST be a well-formed wire-format query or CoreDNS
+    # answers FORMERR (HTTP 400) and the probe spikes EndpointDown even though
+    # DNS itself is up (root cause of the 2026-09-02 "dns down" alert). The old
+    # literal here (`AAABAAAB...`) had QID in the wrong byte order (QID=0x0000,
+    # flags=0x0001) and was rejected. The value below is a correctly-built
+    # query for `roo.lab.internal` A (produced by scripts/doh-probe.py's
+    # build_query; verified HTTP 200 against the live LB).
+    "https://dns.${local.internal_domain}/dns-query?dns=EjQBAAABAAAAAAAAA3JvbwNsYWIIaW50ZXJuYWwAAAEAAQ",
+    # Also probe dns2's vhost directly (it's quietly covered by dns's SAN, but
+    # a direct target catches a broken dns.lab -> dns backend mapping on the LB).
+    "https://dns2.${local.internal_domain}/dns-query?dns=EjQBAAABAAAAAAAAA3JvbwNsYWIIaW50ZXJuYWwAAAEAAQ",
   ]
 
   # Non-HTTP endpoints worth a TCP liveness check (no app-level probe; a
@@ -438,13 +947,18 @@ locals {
     "${local.service_ips.surrealdb}:8000",
     "${local.service_ips.nfs}:2049",
     "${local.service_ips.gitea}:2222",
+    "${local.service_ips.redis}:6379",
   ]
 
   # DNS answers are load-bearing for the whole lab -- probe that each CoreDNS
   # instance actually resolves the zone, not just that the port accepts
   # connections. blackbox's dns module does a full question/answer round-trip.
+  # DNS health checks hit the load balancer (dns.lab.internal) plus both
+  # backends directly, so a single failed CoreDNS behind a still-answering LB
+  # is still detected.
   blackbox_dns_targets = [
-    "${local.service_ips.dns}:53",
+    "${local.service_ips.dns-lb}:53",
+    "${local.service_ips.dns1}:53",
     "${local.service_ips.dns2}:53",
   ]
 
@@ -475,21 +989,27 @@ locals {
               - "${local.service_ips.postgres}:9100"
               - "${local.service_ips.qvault}:9100"
               - "${local.service_ips.penpot}:9100"
-              - "${local.service_ips.dns}:9100"
+              - "${local.service_ips.dns1}:9100"
               - "${local.service_ips.dns2}:9100"
               - "${local.service_ips.ca}:9100"
               - "${local.service_ips.registry}:9100"
               - "${local.service_ips.gitea}:9100"
               - "${local.service_ips.verdaccio}:9100"
               - "${local.service_ips.nfs}:9100"
+              - "${local.service_ips.redis}:9100"
+              - "${local.gitea_runner_ips["gitea-runner-1"]}:9100"
+              - "${local.gitea_runner_ips["gitea-runner-2"]}:9100"
               - "node-exporter:9100"
       - job_name: postgres
         static_configs:
           - targets: ["${local.service_ips.postgres}:9187"]
+      - job_name: redis
+        static_configs:
+          - targets: ["${local.service_ips.redis}:9121"]
       - job_name: coredns
         static_configs:
           - targets:
-              - "${local.service_ips.dns}:9153"
+              - "${local.service_ips.dns1}:9153"
               - "${local.service_ips.dns2}:9153"
       # Uptime probes. The exporter runs as a sibling container (blackbox:9115);
       # relabelling swaps the *reported* instance to the probe target so the
@@ -713,6 +1233,10 @@ module "monitoring" {
   memory_mib       = 2048
   # Grew with the alerting stack (alertmanager + blackbox + ntfy); still small
   # because nothing on this VM stores bulk data beyond prometheus-data.
+  #
+  # auto_sync was temporarily disabled for a disk-replace rebuild; a fresh boot
+  # runs cloud-init automatically (no SSH race). Re-enabled after verification.
+  auto_sync      = true
   disk_gib       = 25
   bridge         = var.vhost_bridge
   static_ip      = "${local.service_ips.monitoring}${var.vhost_lan_cidr_suffix}"
@@ -985,8 +1509,10 @@ module "gitea" {
     # Register the NFS mount in fstab and activate it now (cloud-init does
     # not process fstab on first boot once the system is already up);
     # daemon-reload in runcmd above has already run by the time this fires.
+    # The grep guard keeps cloud-init re-rolls (`cloud-init clean && reboot`,
+    # e.g. a fleet-wide quadlet refresh) from appending the line twice.
     ["mkdir", "-p", "/var/lib/gitea"],
-    ["sh", "-c", "cat /etc/infra/gitea/gitea.nfs.fstab >> /etc/fstab"],
+    ["sh", "-c", "grep -qF ':/gitea /var/lib/gitea' /etc/fstab || cat /etc/infra/gitea/gitea.nfs.fstab >> /etc/fstab"],
     ["systemctl", "daemon-reload"],
     ["mount", "/var/lib/gitea"],
   ]

@@ -228,30 +228,51 @@ sudo update-ca-trust
 
 ### Rolling out config changes to an already-provisioned VM
 
-cloud-init only runs on first boot, so a plain `tofu apply` that changes a
-container, env var, or `extra_files` swaps the cloud-init ISO but an existing VM
-never picks it up. Two options:
+Just run `tofu apply`. Every VM module includes a `terraform_data.config_sync`
+resource that fires (via `triggers_replace`) when the cloud-init content
+changes, SSHes into the running VM, and pushes the new config live — **without
+rebooting the VM and without manual SSH**. This makes `tofu apply` a single,
+pipeline-ready command.
 
-- **Non-destructive** (keeps podman named volumes/data): SSH to the VM and run
-  `sudo cloud-init clean --logs && sudo reboot`. For a fleet-wide refresh
-  (every VM at once, with timer verification at the end), use
-  `bash scripts/rerender-cloudinit-fleet.sh` — it serializes the loop so you
-  never take down two co-dependent services together, and it prints a
-  pass/fail line per VM. Run it *after* the `tofu apply` that replaced the
-  cloud-init volumes.
-- **Destructive** (fresh disk, wipes container volumes AND any host-path bind
-  mounts under the VM's /srv or /var):
-  `tofu apply -replace=module.<x>.libvirt_volume.disk -replace=module.<x>.libvirt_domain.vm`.
-  On these q35/UEFI domains, always replace the domain together with the disk.
-  Do **not** use the destructive form on `module.nfs` or `module.postgres`:
-  gitea's data is the NFS export at `/srv/nfs` (a root-disk bind mount) and its
-  DB schema is the `postgres-data` named volume — replacing those disks destroys
-  the very state the whole "rebuildable services" design exists to protect.
-  For those two VMs use a **cloud-init-only re-roll**: replace just the two
-  cloud-init resources (`libvirt_cloudinit_disk.init` +
-  `libvirt_volume.cloudinit`), then SSH in and run
-  `sudo cloud-init clean --logs && sudo reboot` so the new trust anchor / config
-  is applied onto the SAME disk.
+The sync is zero-downtime where possible:
+- **Config file changes** (Caddyfile, Corefile, prometheus.yml, redis.conf,
+  registries.conf, etc.) are **hot-reloaded**: the file is written to the host
+  path and a reload signal is sent to the container (caddy `reload`, CoreDNS
+  `SIGHUP`, Prometheus `SIGHUP`, etc.). Zero downtime.
+- **Container spec changes** (image, env vars, ports, volumes) trigger a
+  **graceful restart of only the affected container** (~2-5s, not the whole
+  VM). This is a containerization constraint — a running container is a process
+  from a specific image with fixed env vars; changing either requires a new
+  container.
+- **No change** = complete no-op (the sync script hash-compares every file
+  before writing/restarting, so a re-apply with no changes does nothing).
+
+The sync provisioner is enabled by default (`auto_sync = true` in the VM
+module). The operator's SSH key (`ssh_private_key_path`, defaults to
+`~/.ssh/id_ed25519`) is used for the local-exec provisioner.
+
+**Destructive disk replace** (fresh root disk, wipes podman named volumes) is
+still available for cases where a clean slate is needed (corrupted state,
+major OS upgrade). Use `-replace` on all four resources per VM and set
+`auto_sync = false` to skip the redundant sync (fresh-boot cloud-init handles
+it):
+```
+tofu apply -replace=module.<x>.libvirt_cloudinit_disk.init \
+             -replace=module.<x>.libvirt_volume.cloudinit \
+             -replace=module.<x>.libvirt_volume.disk \
+             -replace=module.<x>.libvirt_domain.vm
+```
+Do **not** use the destructive form on `module.nfs` or `module.postgres`:
+gitea's data is the NFS export at `/srv/nfs` (a root-disk bind mount) and its
+DB schema is the `postgres-data` named volume — replacing those disks destroys
+the very state the whole "rebuildable services" design exists to protect.
+For those two VMs use a plain `tofu apply` (the sync provisioner handles the
+config push non-destructively).
+
+For a PKI root rotation the order is: ca first (step-ca must serve the new
+chain), then the rest in any order. The sync provisioner handles this
+automatically — each VM's sync fires when its cloud-init content changes, and
+the `depends_on` graph ensures correct ordering.
 
 ## Known gotchas
 
@@ -326,10 +347,11 @@ never picks it up. Two options:
       cloud-init-only re-roll (replace `libvirt_cloudinit_disk.init` +
       `libvirt_volume.cloudinit`, then `cloud-init clean && reboot` IN the VM),
       NOT a disk replace.
-    - **ca, dns, dns2, registry, gitea, verdaccio, qvault, penpot, monitoring,
-      aspire are safe to disk-replace** (their root disks hold no
-      irreplaceable state; gitea's repos/DB live elsewhere by design).
-    Order: ca first (step-ca must serve the new chain), then dns/dns2 ONE at a
+    - **ca, dns1, dns2, dns-lb, registry, gitea, verdaccio, qvault, penpot,
+      monitoring, aspire, redis, surrealdb, gitea-runner-* are safe to
+      disk-replace** (their root disks hold no irreplaceable state; gitea's
+      repos/DB live elsewhere by design).
+    Order: ca first (step-ca must serve the new chain), then dns1/dns2 ONE at a
     time (never both down together — everything resolves through them), then
     postgres/surrealdb, then the rest in any order.
 - **Postgres `POSTGRES_PASSWORD` only applies on first init of an empty data
