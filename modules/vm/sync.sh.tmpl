@@ -1,0 +1,173 @@
+#!/bin/bash
+# ---------------------------------------------------------------------------
+# Zero-downtime config sync: pushes cloud-init config changes to a RUNNING VM
+# without rebooting it. Generated from the SAME tofu variables as
+# user-data.yaml.tmpl. All file content is pre-rendered and base64-encoded by
+# HCL (in main.tf locals) and passed as variables — this script only decodes
+# and writes. No heredocs, no shell escaping, no content building.
+#
+# Hot-reload strategy:
+#   - Config file only -> write file, send reload signal (SIGHUP for
+#     coredns/prometheus/alertmanager/ntfy). ZERO downtime.
+#   - caddy container spec changed -> rewrite quadlet, daemon-reload, kill 1
+#     inside container (systemd Restart=always brings it back). NOT a reload
+#     because `caddy reload` does NOT trigger ACME cert issuance for new
+#     domains (it says "config is unchanged" and skips the obtain step).
+#     ~2-5s downtime for the caddy container only.
+#   - Other container spec changed -> rewrite quadlet, daemon-reload, restart
+#     ONLY that container. ~2-5s downtime for one container (not the VM).
+#   - No change -> complete no-op (hash-compare before every write/restart).
+# ---------------------------------------------------------------------------
+set -euo pipefail
+
+log() { printf '[sync] %s\n' "$*" >&2; }
+
+file_hash() {
+  if [ -f "$1" ]; then sha256sum "$1" | cut -d' ' -f1; else echo missing; fi
+}
+
+# Write base64-decoded content to a path ONLY if it changed.
+# Args: path, base64_content, perms.
+write_if_changed() {
+  path="$1"; b64="$2"; perms="$3"
+  before=$(file_hash "$path" 2>/dev/null || echo missing)
+  after=$(printf '%s' "$b64" | base64 -d | sha256sum | cut -d' ' -f1)
+  if [ "$before" = "$after" ]; then
+    return 1
+  fi
+  printf '%s' "$b64" | base64 -d | install -D -m "$perms" /dev/stdin "$path"
+  log "wrote $path (content changed)"
+  return 0
+}
+
+reload_signal() {
+  case "$1" in
+    caddy)
+      # caddy always restarts (not reloads): `caddy reload` does NOT trigger
+      # ACME cert issuance for new domains (it says "config is unchanged"
+      # and skips the obtain step). A full process restart is required so
+      # caddy re-evaluates the Caddyfile, detects new hostnames, and starts
+      # the ACME challenge. Returning "RESTART" tells the caller to use
+      # podman restart (safe) instead of kill 1 (can corrupt netns).
+      echo "RESTART"
+      ;;
+    coredns) echo "kill -s HUP 1" ;;
+    prometheus) echo "kill -s HUP 1" ;;
+    alertmanager) echo "kill -s HUP 1" ;;
+    ntfy) echo "kill -s HUP 1" ;;
+    *) echo "" ;;
+  esac
+}
+
+changed_containers=""
+
+# ---------------------------------------------------------------------------
+# Phase 1: Write config files (extra_files).
+# ---------------------------------------------------------------------------
+log "phase 1: writing config files"
+
+%{ for f in extra_files ~}
+if write_if_changed "${f.path}" "${f.b64}" "${f.permissions}"; then
+  log "config file changed: ${f.path}"
+fi
+%{ endfor ~}
+
+# ---------------------------------------------------------------------------
+# Phase 2: Write systemd-resolved drop-in.
+# ---------------------------------------------------------------------------
+if write_if_changed "/etc/systemd/resolved.conf.d/50-lab-dns.conf" "${resolved_b64}" "0644"; then
+  systemctl restart systemd-resolved 2>/dev/null || true
+fi
+
+# ---------------------------------------------------------------------------
+# Phase 3: Write the vmnet.network file.
+# ---------------------------------------------------------------------------
+write_if_changed "/etc/containers/systemd/vmnet.network" "${vmnet_b64}" "0644" || true
+
+# ---------------------------------------------------------------------------
+# Phase 4: Write quadlet .container files.
+# ---------------------------------------------------------------------------
+log "phase 2: syncing quadlet files"
+
+%{ for c in containers ~}
+if write_if_changed "/etc/containers/systemd/${c.name}.container" "${c.b64}" "0644"; then
+  changed_containers="$changed_containers ${c.name}"
+  log "quadlet changed: ${c.name}"
+fi
+%{ endfor ~}
+
+# ---------------------------------------------------------------------------
+# Phase 5: Apply changes. daemon-reload, then hot-reload or graceful restart.
+# ---------------------------------------------------------------------------
+if [ -n "$changed_containers" ]; then
+  log "daemon-reload (quadlet files changed)"
+  systemctl daemon-reload
+fi
+
+# restart_container: bounce a quadlet-managed container. Quadlets set
+# RefuseManualStop=yes, so `systemctl stop/restart` is refused. Use
+# `podman restart` directly — it stops and starts the container without
+# going through systemd's stop gate, and systemd's Restart=always sees
+# the container come back up. This is safer than `kill 1` inside the
+# container (which can corrupt podman's network namespace if the
+# process doesn't handle SIGTERM cleanly — the netavark setns IO error
+# that corrupted the postgres VM on 2026-09-01).
+restart_container() {
+  name="$1"
+  if systemctl is-active --quiet "$name.service"; then
+    log "restarting $name via podman restart (RefuseManualStop)"
+    podman restart "$name" 2>/dev/null
+    sleep 2
+  else
+    log "starting $name (was not running)"
+    systemctl start "$name.service" 2>/dev/null || true
+  fi
+}
+
+for name in $changed_containers; do
+  [ -z "$name" ] && continue
+  sig=$(reload_signal "$name")
+  if [ "$sig" = "RESTART" ]; then
+    # caddy: always restart (not reload) for ACME cert issuance
+    log "restart: $name (RESTART signal)"
+    restart_container "$name"
+  elif [ -n "$sig" ] && systemctl is-active --quiet "$name.service"; then
+    log "hot-reload: $name ($sig)"
+    if ! podman exec "$name" sh -c "$sig" 2>/dev/null; then
+      log "reload failed for $name, falling back to restart"
+      restart_container "$name"
+    fi
+  else
+    log "restart: $name (no hot-reload signal or not running)"
+    restart_container "$name"
+  fi
+done
+
+# ---------------------------------------------------------------------------
+# Phase 6: Run extra_runcmd (one-time setup, idempotent).
+# ---------------------------------------------------------------------------
+log "phase 3: extra setup (idempotent)"
+
+%{ for r in extra_runcmd ~}
+%{~ if length(r) == 0 ~}
+%{~ else ~}
+%{~ for arg in r ~}'${arg}' %{ endfor ~}|| true
+%{~ endif ~}
+%{ endfor ~}
+
+update-ca-trust 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+# Quadlet watchdog: if the files landed/updated above, register the units and
+# arm the timer. Runs unconditionally (idempotent) — `systemctl enable --now`
+# short-circuits to a no-op when already enabled, and `daemon-reload` is safe
+# to re-run. Skipped silently on VMs that received no watchdog files (e.g.
+# oneshot-only or no-container VMs).
+# ---------------------------------------------------------------------------
+if [ -f /etc/systemd/system/quadlet-watchdog.timer ]; then
+  log "watchdog: enabling quadlet-watchdog.timer"
+  systemctl daemon-reload
+  systemctl enable --now quadlet-watchdog.timer 2>/dev/null || true
+fi
+
+log "sync complete"

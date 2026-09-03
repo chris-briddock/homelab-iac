@@ -3,11 +3,10 @@
 #
 # Brings the existing libvirt resources (pools, volumes, domains) for the
 # *already-provisioned* VMs back into OpenTofu state after the tfstate was
-# lost and the provider was upgraded from 0.8.x to 0.9.x (full breaking
-# rewrite — the old 0.8.x state entries are schema-incompatible and must
-# be removed before re-importing with 0.9.x IDs).
+# lost (postgres VM state backend was wiped by `podman system reset --force`
+# during emergency recovery on 2026-09-01).
 #
-# Net-new resources (gitea, verdaccio, their random_passwords, the PKI, and
+# Net-new resources (random_password, terra_data.config_sync, PKI files, and
 # the local-default-provider pool/base) are deliberately NOT imported here —
 # they are created by the subsequent `tofu apply`.
 #
@@ -44,13 +43,9 @@ imp() {
 }
 
 # ---------------------------------------------------------------------------
-# Step 1: remove stale 0.8.x state entries (schema-incompatible with 0.9.x).
+# Step 1: remove any stale state entries (if re-running).
 # ---------------------------------------------------------------------------
-# The 0.8.x cloudinit_disk has a "pool" attribute that 0.9.x doesn't know
-# about, causing "unsupported attribute" errors on any state operation.
-# Remove ALL libvirt resources from state; random_password/tls entries
-# (non-libvirt providers) are left intact.
-echo "=== removing stale 0.8.x libvirt state entries ==="
+echo "=== removing stale libvirt state entries ==="
 for addr in $(tofu state list 2>/dev/null | grep -E '(^|\.)libvirt_'); do
   echo "rm: ${addr}"
   tofu state rm "${addr}" >/dev/null
@@ -74,7 +69,9 @@ imp "libvirt_volume.base_vhost" "${POOL_DIR}/fedora-cloud-base.qcow2"
 # libvirt_cloudinit_disk.init is NOT imported — it has no ImportState in 0.9.x.
 # It will be regenerated on the next plan (just creates a temp ISO; the
 # libvirt_volume.cloudinit already holds the uploaded ISO in the pool).
-VMs=(
+
+# Simple module VMs (one instance per module, keyed by module name).
+SIMPLE_VMS=(
   "surrealdb|surrealdb-vm"
   "postgres|postgres-vm"
   "penpot|penpot-vm"
@@ -82,23 +79,46 @@ VMs=(
   "aspire|aspire-vm"
   "ca|ca-vm"
   "registry|registry-vm"
+  "gitea|gitea-vm"
+  "verdaccio|verdaccio-vm"
+  "nfs|nfs-vm"
+  "redis|redis-vm"
+  "qvault|qvault-vm"
+  "dns_lb|dns-lb-vm"
 )
 
-for row in "${VMs[@]}"; do
+for row in "${SIMPLE_VMS[@]}"; do
   IFS='|' read -r key dom <<<"$row"
   imp "module.${key}.libvirt_volume.disk"       "${POOL_DIR}/${dom}.qcow2"
-  imp "module.${key}.libvirt_volume.cloudinit"  "${POOL_DIR}/${dom}-cloudinit.iso"
+  if virsh vol-path "${dom}-cloudinit.iso" --pool "${POOL}" >/dev/null 2>&1; then
+    imp "module.${key}.libvirt_volume.cloudinit"  "${POOL_DIR}/${dom}-cloudinit.iso"
+  else
+    echo "skip (no cloudinit vol): module.${key}.libvirt_volume.cloudinit"
+  fi
   uuid="$(virsh domuuid "${dom}")"
   imp "module.${key}.libvirt_domain.vm"          "${uuid}"
 done
 
 # dns uses for_each, so its addresses include the map key.
-for k in dns dns2; do
+for k in dns1 dns2; do
   dom="${k}-vm"
   imp "module.dns[\"${k}\"].libvirt_volume.disk"       "${POOL_DIR}/${dom}.qcow2"
-  imp "module.dns[\"${k}\"].libvirt_volume.cloudinit"  "${POOL_DIR}/${dom}-cloudinit.iso"
+  if virsh vol-path "${dom}-cloudinit.iso" --pool "${POOL}" >/dev/null 2>&1; then
+    imp "module.dns[\"${k}\"].libvirt_volume.cloudinit"  "${POOL_DIR}/${dom}-cloudinit.iso"
+  fi
   uuid="$(virsh domuuid "${dom}")"
   imp "module.dns[\"${k}\"].libvirt_domain.vm"          "${uuid}"
+done
+
+# gitea_runner uses for_each, so its addresses include the map key.
+for k in gitea-runner-1 gitea-runner-2; do
+  dom="${k}-vm"
+  imp "module.gitea_runner[\"${k}\"].libvirt_volume.disk"       "${POOL_DIR}/${dom}.qcow2"
+  if virsh vol-path "${dom}-cloudinit.iso" --pool "${POOL}" >/dev/null 2>&1; then
+    imp "module.gitea_runner[\"${k}\"].libvirt_volume.cloudinit"  "${POOL_DIR}/${dom}-cloudinit.iso"
+  fi
+  uuid="$(virsh domuuid "${dom}")"
+  imp "module.gitea_runner[\"${k}\"].libvirt_domain.vm"          "${uuid}"
 done
 
 echo "=== import done; state list ==="

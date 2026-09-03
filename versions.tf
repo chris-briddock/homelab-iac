@@ -12,6 +12,16 @@ terraform {
   # Encrypt state + plan files at rest (they hold the root CA key and service
   # passwords). PBKDF2 derives a key from a passphrase supplied via env var:
   #   export TF_ENCRYPTION_PASSPHRASE="<strong passphrase>"
+  # Encrypt state + plan files at rest (they hold the root CA key and service
+  # passwords). PBKDF2 derives a key from a passphrase supplied via env var:
+  #   export TF_VAR_tf_encryption_passphrase="<passphrase>"
+  #
+  # NOTE (todo #8): passphrase rotation is NOT a plain two-key `fallback` — tofu
+  # 1.12 treats a present fallback block as an active key migration and stops
+  # reading state with the primary key. Rotate via the documented pull/push
+  # procedure (scripts/recover-state.sh pattern): pull state decrypted with the
+  # old passphrase, swap this passphrase to the new value, re-init/push so tofu
+  # re-encrypts + rewrites, then verify reads with the new passphrase.
   encryption {
     key_provider "pbkdf2" "state" {
       passphrase = var.tf_encryption_passphrase
@@ -37,6 +47,12 @@ terraform {
     random = {
       source  = "hashicorp/random"
       version = "~> 3.6"
+    }
+    # OpenBao is API-compatible with Vault (MPL-2.0 fork) -- use the upstream
+    # provider (auth methods, policies, users, KV entries).
+    vault = {
+      source  = "hashicorp/vault"
+      version = "~> 4.4"
     }
   }
 }

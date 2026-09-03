@@ -1,0 +1,12 @@
+# quay.io via the lab pull-through cache (the same registry VM the infra
+# services use — see services.tf 50-docker-mirror.conf). Docker falls back to
+# the real registry automatically when the mirror is unreachable.
+#
+# Install on the dev laptop:
+#   sudo mkdir -p /etc/docker/certs.d/quay.io
+#   sudo cp scripts/docker-mirror-hosts-quay.toml /etc/docker/certs.d/quay.io/hosts.toml
+#   sudo systemctl restart docker
+server = "https://quay.io"
+
+[host."https://registry.lab.internal/quay.io"]
+  capabilities = ["pull", "resolve"]

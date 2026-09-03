@@ -15,11 +15,32 @@ package_update: true
 packages:
   - podman
   - qemu-guest-agent
+  # Provides the dnf5-automatic.timer enabled in runcmd below (daily host
+  # package updates; /etc/dnf/automatic.conf from write_files sets
+  # apply_updates=yes). Not part of the Fedora Cloud base image.
+  - dnf5-plugin-automatic
 %{ for p in extra_packages ~}
   - ${p}
 %{ endfor ~}
 
 write_files:
+  # systemd-resolved: pin the internal DNS as the link-local resolver for
+  # lab.internal and demote any public fallback (1.1.1.1) to a low-priority
+  # catch-all routing domain (~.). netplan (network-config.yaml.tmpl) can't
+  # express this split, so without this drop-in a public server listed in
+  # DNS= would sometimes have its NXDOMAIN for lab.internal accepted as
+  # final. The drop-in overrides the link config regardless of netplan.
+  - path: /etc/systemd/resolved.conf.d/50-lab-dns.conf
+    permissions: "0644"
+    content: |
+      [Resolve]
+      DNS=${join(" ", [for d in dns : d if can(regex("^192\\.168\\.", d))])}
+      Domains=lab.internal
+      %{~ if length([for d in dns : d if !can(regex("^192\\.168\\.", d))]) > 0 ~}
+      # Public fallback: only queried for names outside lab.internal, and only
+      # when the internal DNS above is unreachable (hence the trailing ~.).
+      FallbackDNS=${join(" ", [for d in dns : d if !can(regex("^192\\.168\\.", d))])}
+      %{~ endif ~}
   - path: /etc/modules-load.d/br_netfilter.conf
     permissions: "0644"
     content: |
@@ -73,6 +94,15 @@ write_files:
       Wants=${d}.service
       After=${d}.service
 %{ endfor ~}
+      # [Unit]-only option: systemd refuses manual `systemctl stop` /
+      # `kill` on the unit by default. A compromised process inside the
+      # container calling systemd would've needed CAP_KILL against host
+      # PID 1 *and* a working mount of the host systemd D-Bus socket,
+      # neither of which it has -- but a manual stop by the operator is a
+      # documented way to render a quadlet-managed container unrecoverable
+      # without a `daemon-reload`, so we refuse it outright. Use
+      # `systemctl restart` for intentional bounce.
+      RefuseManualStop=yes
 
       [Container]
       Image=${c.image}
@@ -96,6 +126,9 @@ write_files:
 %{ if c.user != "" ~}
       User=${c.user}
 %{ endif ~}
+%{ if c.entrypoint != "" ~}
+      Entrypoint=${c.entrypoint}
+%{ endif ~}
 %{ if c.command != "" ~}
       Exec=${c.command}
 %{ endif ~}
@@ -105,12 +138,51 @@ write_files:
 %{ if c.oneshot ~}
       # Oneshot bootstrap sidecar: run once at boot, stay "active" via
       # RemainAfterExit so dependents ordering after it see success.
+      # NOTE: no Restart= here -- Type=oneshot with any Restart= value is a
+      # systemd config error, so Restart=always stays exclusive to the
+      # long-running containers below (where it is already emitted).
       Type=oneshot
       RemainAfterExit=yes
 %{ else ~}
       Restart=always
 %{ endif ~}
       TimeoutStartSec=900
+
+      # NO unit-level hardening here on the [Service] section, once and
+      # for all. Two lessons from 2026-08-31/2026-09-01:
+      #
+      # 1. Directives like ProtectSystem=strict/PrivateDevices/
+      #    ProtectKernelTunables/ProtectControlGroups/NoNewPrivileges
+      #    apply to the PODMAN PROCESS on the host, not to the
+      #    container. Podman central to quadlet starts writes/locks
+      #    under /var/lib/containers, /sys/fs/cgroup, /run/libpod and
+      #    configures sysctls on its own veth; sandbox either of
+      #    those and podman can't start.
+      #
+      # 2. Empirical testing of the "safe" subset (PrivateTmp /
+      #    LockPersonality / RestrictSUIDSGID / ProtectKernelModules /
+      #    ProtectHome / ProtectSystem=full / RefuseManualStop) was
+      #    done one directive at a time on postgres-vm and each
+      #    individually passed.  Rolling ALL of them fleet-wide at
+      #    once still left coredns + caddy + every container failing
+      #    across the rebuilt VMs with unexplained "Job for
+      #    coredns.service failed because the control process exited
+      #    with error code" — meaning: one or more of the subset
+      #    breaks podman in a multi-directive interaction that single-
+      #    directive smoke tests did not catch.  Bisecting that
+      #    matrix is not worth the complexity in this template.
+      #
+      # The only sandbox knob we keep is RefuseManualStop=yes — and it
+      # lives in [Unit], not [Service]. RefuseManualStop=true only makes
+      # systemd reject `systemctl stop` against the unit; the operator
+      # uses `systemctl restart` for intentional bounce.  It does not
+      # touch podman's path and is the documented way to flag a quadlet
+      # as "managed by the toolchain, not by hand".
+      #
+      # If a future audit wants per-container hardening, do it at the
+      # Container level (SELinux label, DropCapability on Container,
+      # NoNewPrivileges on Container, not on Unit) where it actually
+      # constrains what runs INSIDE the container, not the runtime.
 
       [Install]
       WantedBy=multi-user.target
