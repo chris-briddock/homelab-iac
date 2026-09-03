@@ -6,23 +6,25 @@ output "vm_ips" {
 output "service_ips" {
   description = "IPv4 addresses of the real services on the vhost (bridged LAN, DHCP-assigned)"
   value = {
-    surrealdb      = module.surrealdb.ipv4
-    postgres       = module.postgres.ipv4
-    qvault         = module.qvault.ipv4
-    penpot         = module.penpot.ipv4
-    monitoring     = module.monitoring.ipv4
-    aspire         = module.aspire.ipv4
-    dns-lb         = module.dns_lb.ipv4
-    dns1           = module.dns["dns1"].ipv4
-    dns2           = module.dns["dns2"].ipv4
-    ca             = module.ca.ipv4
-    registry       = module.registry.ipv4
-    gitea          = module.gitea.ipv4
-    verdaccio      = module.verdaccio.ipv4
-    nfs            = module.nfs.ipv4
-    redis          = module.redis.ipv4
-    gitea-runner-1 = module.gitea_runner["gitea-runner-1"].ipv4
-    gitea-runner-2 = module.gitea_runner["gitea-runner-2"].ipv4
+    surrealdb       = module.surrealdb.ipv4
+    postgres        = module.postgres.ipv4
+    qvault          = module.qvault.ipv4
+    penpot          = module.penpot.ipv4
+    monitoring      = module.monitoring.ipv4
+    aspire          = module.aspire.ipv4
+    dns-lb          = module.dns_lb.ipv4
+    dns1            = module.dns["dns1"].ipv4
+    dns2            = module.dns["dns2"].ipv4
+    ca              = module.ca.ipv4
+    registry        = module.registry.ipv4
+    gitea           = module.gitea.ipv4
+    verdaccio       = module.verdaccio.ipv4
+    nfs             = module.nfs.ipv4
+    redis           = module.redis.ipv4
+    openbao         = module.openbao.ipv4
+    openbao-transit = module.openbao_transit.ipv4
+    gitea-runner-1  = module.gitea_runner["gitea-runner-1"].ipv4
+    gitea-runner-2  = module.gitea_runner["gitea-runner-2"].ipv4
   }
 }
 
@@ -35,7 +37,7 @@ output "root_ca_pem" {
 # "https://ntfy.lab.internal/<ntfy_alert_topic>" to receive downt alerts.
 output "ntfy_alert_topic" {
   description = "Random ntfy topic Alertmanager posts downtime alerts to (subscribe the phone app to https://ntfy.lab.internal/<this>)"
-  value       = random_password.ntfy_alert_topic.result
+  value       = local.secrets_values.ntfy_alert_topic
   sensitive   = true
 }
 
@@ -59,6 +61,8 @@ output "service_urls" {
     redis = "rediss://redis.${local.internal_domain}:6379"
     dns   = "https://dns.${local.internal_domain}/dns-query"
     dns2  = "https://dns2.${local.internal_domain}/dns-query"
+    # OpenBao API/UI (caddy-fronted TLS; auto-unseals via the transit provider).
+    openbao = "https://openbao.${local.internal_domain}"
   }
 }
 
@@ -67,26 +71,50 @@ output "service_urls" {
 # in plain text by `tofu output` without `-raw`.
 output "postgres_password" {
   description = "Postgres superuser password (also the tofu state backend password — used in PG_CONN_STR)"
-  value       = random_password.postgres.result
+  value       = local.secrets_values.postgres_password
   sensitive   = true
 }
 
 output "secrets" {
-  description = "Generated credentials for the real services (retrieve with: tofu output -json secrets)"
+  description = "Service credentials (sourced from OpenBao KV; retrieve with: tofu output -json secrets)"
   sensitive   = true
   value = {
-    surrealdb_root_password  = random_password.surrealdb_root.result
-    postgres_password        = random_password.postgres.result
-    qvault_session_secret    = random_password.qvault_session_secret.result
-    qvault_server_secret     = random_password.qvault_server_secret.result
-    penpot_secret_key        = random_password.penpot_secret_key.result
-    penpot_postgres_password = random_password.penpot_postgres.result
-    grafana_admin_password   = random_password.grafana_admin.result
-    gitea_db_password        = random_password.gitea_db.result
-    gitea_internal_token     = random_password.gitea_internal_token.result
-    gitea_secret_key         = random_password.gitea_secret_key.result
-    gitea_jwt_secret         = random_password.gitea_jwt_secret.result
-    ntfy_alert_topic         = random_password.ntfy_alert_topic.result
-    redis_password           = random_password.redis.result
+    surrealdb_root_password  = local.secrets_values.surrealdb_root_password
+    postgres_password        = local.secrets_values.postgres_password
+    qvault_session_secret    = local.secrets_values.qvault_session_secret
+    qvault_server_secret     = local.secrets_values.qvault_server_secret
+    penpot_secret_key        = local.secrets_values.penpot_secret_key
+    penpot_postgres_password = local.secrets_values.penpot_postgres_password
+    grafana_admin_password   = local.secrets_values.grafana_admin_password
+    gitea_db_password        = local.secrets_values.gitea_db_password
+    gitea_internal_token     = local.secrets_values.gitea_internal_token
+    gitea_secret_key         = local.secrets_values.gitea_secret_key
+    gitea_jwt_secret         = local.secrets_values.gitea_jwt_secret
+    ntfy_alert_topic         = local.secrets_values.ntfy_alert_topic
+    redis_password           = local.secrets_values.redis_password
   }
+}
+
+# Usernames for the same credentials, also sourced from OpenBao (not hardcoded).
+# "" means the credential has no username (api token / app key / redis AUTH).
+output "secrets_usernames" {
+  description = "Usernames for the service credentials, sourced from OpenBao (empty string = no username). Retrieve with: tofu output -json secrets_usernames"
+  sensitive   = true
+  value       = local.secret_usernames
+}
+
+output "openbao_ui_login" {
+  description = "Sign-in details for the OpenBao UI. Password via 'tofu output openbao_admin_bootstrap_password' (sensitive)."
+  value = {
+    url      = "https://openbao.${local.internal_domain}/ui"
+    method   = "userpass"
+    path     = vault_auth_backend.userpass.path
+    username = var.openbao_admin_username
+  }
+}
+
+output "openbao_admin_bootstrap_password" {
+  description = "FIRST-USE bootstrap password for the OpenBao operator. Rotate via UI immediately after first login."
+  value       = random_password.openbao_admin_bootstrap.result
+  sensitive   = true
 }

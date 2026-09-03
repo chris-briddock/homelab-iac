@@ -43,16 +43,34 @@ Two secrets are required as env vars for **every** `tofu` command (never
 committed; store them in your password manager):
 
 ```plaintext
-# Backend connection (pg backend reads PG_CONN_STR):
-export PG_CONN_STR="postgres://tofu:<db-password>@192.168.70.11:5432/tofu_state?sslmode=disable"
+# Backend connection (pg backend reads PG_CONN_STR). The `tofu` role has its
+# OWN dedicated password — NOT the postgres superuser password (split in the
+# 2026-09 state rebuild):
+export PG_CONN_STR="postgres://tofu:<tofu-role-password>@192.168.70.11:5432/tofu_state?sslmode=disable"
 # State/plan encryption passphrase (feeds var.tf_encryption_passphrase):
 export TF_VAR_tf_encryption_passphrase="<passphrase>"
+# OpenBao main root token (vault provider; the KV data sources in secrets.tf
+# are read at PLAN time, so this is needed on every plan/apply, not just init):
+export TF_VAR_openbao_root_token="<main-root-token s....>"
+# gitea runner registration token: minted in the Gitea admin UI, only consumed
+# when (re)registering runners — any non-empty placeholder satisfies plans that
+# don't touch module.gitea_runner:
+export TF_VAR_gitea_runner_registration_token="<token-or-placeholder>"
 ```
 
-The credentials were generated at migration time and are not stored in this repo.
-Re-running `tofu init` requires both vars. Local `terraform.tfstate*` files are
-gitignored leftovers/backups from before the migration; the real state is in
-Postgres.
+The credentials were generated in the 2026-09 state rebuild and are not stored
+in this repo. Service secrets (DB passwords, app keys — **including the `tofu`
+role password as `platform/services/tofu_state_password`**, with usernames)
+live in **OpenBao KV** at `secret/platform/services/*`; tofu only **reads**
+them via `data "vault_kv_secret_v2"`. Re-running `tofu init` needs the four
+vars above. Local `terraform.tfstate*` files are gitignored leftovers/backups
+from before the migration; the real state is in Postgres.
+
+Note on **passphrase rotation**: state encryption does NOT support two-key
+rotation via `fallback` (OpenTofu 1.12.4 stops reading with the primary key —
+"no decryption key available"). To rotate, rebuild via a temporary local
+backend and re-import (see `scripts/rebuild-state.sh`), which is exactly how
+the current state was produced.
 
 ## Two libvirt connections
 

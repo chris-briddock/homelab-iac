@@ -39,3 +39,6 @@ terraform.rc
 # scripts/gen-pki.sh); certs (pki/*.crt) are committable.
 pki/*.key
 pki/*.srl
+
+# OpenBao bootstrap artifacts (root/recovery keys) - never commit
+.openbao-custody/

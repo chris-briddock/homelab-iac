@@ -21,6 +21,11 @@ locals {
     # to it (infra.tf dns_cname_records) so the dns.lab.internal name the rest
     # of the stack references resolves to this IP.
     dns-lb = "192.168.70.26"
+    # OpenBao secrets management: openbao-vm (.27) is the main cluster; the
+    # transit-seal provider lives on its own dedicated VM (.28) so one guest
+    # reboot never takes down two trust anchors. See plans/openbao-deployment.md.
+    openbao         = "192.168.70.27"
+    openbao-transit = "192.168.70.28"
   }
 
   # Gitea Actions runner executor VMs. Nested in service_ips would force
@@ -164,6 +169,10 @@ locals {
     # with path-routing to multiple backend instances (writable + 4 caches).
     gitea     = { gitea = "gitea:3000" }
     verdaccio = { verdaccio = "verdaccio:4873" }
+    # OpenBao main cluster: caddy terminates openbao.lab.internal and proxies
+    # to the openbao container's API on :8200 (plaintext inside vmnet; TLS at
+    # the edge, same as every other service).
+    openbao = { openbao = "openbao:8200" }
   }
 
   # The tls issuer must be set explicitly per site: Caddy classifies
@@ -345,6 +354,75 @@ locals {
   EOT
 }
 
+# ---------------------------------------------------------------------------
+# OpenBao secrets management (plans/openbao-deployment.md)
+# ---------------------------------------------------------------------------
+locals {
+  # Main OpenBao server config (openbao-vm, .27). Single-node Raft integrated
+  # storage on the openbao-data named volume (data dir /openbao — OpenBao's
+  # image layout, NOT /vault). TLS is terminated by caddy on :443, so the
+  # listener is plaintext :8200 inside the podman vmnet network (same edge-TLS
+  # pattern as every other service). Auto-unseal via a transit seal pointing at
+  # the dedicated openbao-transit-vm (.28). The transit token is substituted
+  # from a root-only file delivered out-of-band (NEVER via tofu/extra_files —
+  # it would land in tfstate); the __TRANSIT_TOKEN__ placeholder is replaced by
+  # a tiny config-render step before the openbao service starts.
+  openbao_config = <<-EOT
+    ui           = true
+    api_addr     = "https://openbao.${local.internal_domain}"
+    cluster_addr = "https://${local.service_ips.openbao}:8201"
+
+    listener "tcp" {
+      address     = "0.0.0.0:8200"
+      tls_disable = true
+    }
+
+    storage "raft" {
+      # Raft storage path = the mount root of the openbao-data volume
+      # (openbao-data:/openbao). Using the root (image-owned, exists, writable)
+      # avoids the "failed to create fsm / open <path>/vault.db: no such file
+      # or directory" crash that occurs when pointing at a non-existent subdir
+      # that bolt/raft will not create inside the mount.
+      path    = "/openbao"
+      node_id = "openbao-1"
+    }
+
+    # NOTE: this is the DEFAULT (Shamir) config. A `seal` block is deliberately
+    # absent so the main openbao always starts cleanly on its own:
+    #   - no `seal` block  => Shamir seal. `bao operator init` + `bao operator
+    #     unseal` (the operator's recovery keys) get it serving.
+    #   - transit auto-unseal is an OPTIONAL operator overlay: to enable it,
+    #     paste the seal "transit" { ... } block (with the real transit token,
+    #     which is delivered out-of-band and never stored in tofu/extra_files)
+    #     here on the VM at /etc/infra/openbao/openbao.hcl only, then run
+    #     `bao operator migrate`, then restart. Keeping it out of the default
+    #     config avoids the init/auto-unseal chicken-and-egg AND keeps the
+    #     transit token out of the templating path entirely. See the runbook
+    #     in plans/openbao-deployment.md §6.
+  EOT
+
+  # Transit-seal provider config (openbao-transit-vm, .28). Shamir-sealed (no
+  # `seal` block = Shamir); the operator unseals it manually after a transit-vm
+  # reboot (the documented root-of-trust bottom). LAN-internal only — no caddy
+  # in front; the main openbao reaches it directly on :8200.
+  transit_config = <<-EOT
+    ui           = false
+    api_addr     = "http://${local.service_ips.openbao-transit}:8200"
+    cluster_addr = "https://${local.service_ips.openbao-transit}:8201"
+
+    listener "tcp" {
+      address     = "0.0.0.0:8200"
+      tls_disable = true
+    }
+
+    storage "raft" {
+      # Same fix as the main cluster: mount root of transit-data:/openbao.
+      path    = "/openbao"
+      node_id = "openbao-transit-1"
+    }
+  EOT
+}
+
 # 0.9.x: libvirt pools cannot be updated in-place — any change forces
 # replacement, which would destroy the pool and all volumes in it.  This
 # pool was imported from the already-running libvirt, so ignore all
@@ -428,8 +506,8 @@ module "surrealdb" {
       # permission failure.
       user = "0"
       environment = {
-        SURREAL_USER = "root"
-        SURREAL_PASS = random_password.surrealdb_root.result
+        SURREAL_USER = local.secret_usernames.surrealdb_root_password
+        SURREAL_PASS = local.secrets_values.surrealdb_root_password
         SURREAL_PATH = "rocksdb:/data/database.db"
         SURREAL_BIND = "0.0.0.0:8000"
       }
@@ -468,12 +546,12 @@ module "postgres" {
   extra_files = [local.registry_mirror_file, local.root_ca_anchor_file]
 
   # Create the tofu state backend (tofu_state DB + tofu role) on first boot.
-  # This runs after the postgres container starts (cloud-init write_files +
-  # runcmd order). The password is the same as POSTGRES_PASSWORD for simplicity
-  # — the operator sets PG_CONN_STR to match. Idempotent: CREATE ROLE IF NOT
-  # EXISTS and CREATE DATABASE IF NOT EXISTS.
+  # The tofu role has a DEDICATED password (tofu_state_password in OpenBao) that
+  # is SEPARATE from the postgres superuser password — PG_CONN_STR uses this
+  # role+password, never the superuser. The runcmd runs as the superuser
+  # (postgres_password) to provision the role+db. Idempotent.
   extra_runcmd = [
-    ["bash", "-c", "until podman exec postgres psql -U postgres -c 'SELECT 1' >/dev/null 2>&1; do sleep 2; done; podman exec postgres psql -U postgres -v ON_ERROR_STOP=1 -c \"CREATE ROLE tofu LOGIN PASSWORD '${random_password.postgres.result}'\" || podman exec postgres psql -U postgres -v ON_ERROR_STOP=1 -c \"ALTER ROLE tofu WITH LOGIN PASSWORD '${random_password.postgres.result}'\"; podman exec postgres psql -U postgres -v ON_ERROR_STOP=1 -c 'CREATE DATABASE tofu_state OWNER tofu' || true; podman exec postgres psql -U postgres -v ON_ERROR_STOP=1 -c 'GRANT ALL ON DATABASE tofu_state TO tofu'"],
+    ["bash", "-c", "until podman exec postgres psql -U ${local.secret_usernames.postgres_password} -c 'SELECT 1' >/dev/null 2>&1; do sleep 2; done; podman exec postgres psql -U ${local.secret_usernames.postgres_password} -v ON_ERROR_STOP=1 -c \"CREATE ROLE tofu LOGIN PASSWORD '${local.secrets_values.tofu_state_password}'\" || podman exec postgres psql -U ${local.secret_usernames.postgres_password} -v ON_ERROR_STOP=1 -c \"ALTER ROLE tofu WITH LOGIN PASSWORD '${local.secrets_values.tofu_state_password}'\"; podman exec postgres psql -U ${local.secret_usernames.postgres_password} -v ON_ERROR_STOP=1 -c 'CREATE DATABASE tofu_state OWNER tofu' || true; podman exec postgres psql -U ${local.secret_usernames.postgres_password} -v ON_ERROR_STOP=1 -c 'GRANT ALL ON DATABASE tofu_state TO tofu'"],
   ]
 
   containers = [
@@ -482,7 +560,8 @@ module "postgres" {
       image = "docker.io/library/postgres:16"
       ports = ["5432:5432"]
       environment = {
-        POSTGRES_PASSWORD = random_password.postgres.result
+        POSTGRES_USER     = local.secret_usernames.postgres_password
+        POSTGRES_PASSWORD = local.secrets_values.postgres_password
       }
       volumes = ["postgres-data:/var/lib/postgresql/data"]
     },
@@ -492,7 +571,7 @@ module "postgres" {
       ports      = ["9187:9187"]
       depends_on = ["postgres"]
       environment = {
-        DATA_SOURCE_NAME = "postgresql://postgres:${random_password.postgres.result}@postgres:5432/postgres?sslmode=disable"
+        DATA_SOURCE_NAME = "postgresql://${local.secret_usernames.postgres_password}:${local.secrets_values.postgres_password}@postgres:5432/postgres?sslmode=disable"
       }
     },
     {
@@ -524,7 +603,7 @@ locals {
     # Clients authenticate by password, not client certs.
     tls-auth-clients no
 
-    requirepass ${random_password.redis.result}
+    requirepass ${local.secrets_values.redis_password}
 
     # Treat this as a cache, not a store: bounded memory, LRU eviction, and
     # no persistence -- losing the dataset on rebuild is by design.
@@ -595,7 +674,7 @@ module "redis" {
       # exporter reads REDIS_PASSWORD straight from the environment.
       command = "--redis.addr=rediss://redis:6379 --skip-tls-verification"
       environment = {
-        REDIS_PASSWORD = random_password.redis.result
+        REDIS_PASSWORD = local.secrets_values.redis_password
       }
     },
     {
@@ -775,10 +854,10 @@ module "qvault" {
         SURREALDB_URL        = "ws://${local.service_ips.surrealdb}:8000/rpc"
         SURREALDB_NS         = "qvault"
         SURREALDB_DB         = "qvault"
-        SURREALDB_USER       = "root"
-        SURREALDB_PASS       = random_password.surrealdb_root.result
-        SESSION_SECRET       = random_password.qvault_session_secret.result
-        SERVER_SECRET        = random_password.qvault_server_secret.result
+        SURREALDB_USER       = local.secret_usernames.surrealdb_root_password
+        SURREALDB_PASS       = local.secrets_values.surrealdb_root_password
+        SESSION_SECRET       = local.secrets_values.qvault_session_secret
+        SERVER_SECRET        = local.secrets_values.qvault_server_secret
         WEBAUTHN_RP_NAME     = "QVault"
         WEBAUTHN_RP_ID       = "qvault.${local.internal_domain}"
         WEBAUTHN_ORIGIN      = "https://qvault.${local.internal_domain}"
@@ -840,8 +919,8 @@ module "penpot" {
       name  = "penpot-postgres"
       image = "docker.io/library/postgres:15"
       environment = {
-        POSTGRES_USER     = "penpot"
-        POSTGRES_PASSWORD = random_password.penpot_postgres.result
+        POSTGRES_USER     = local.secret_usernames.penpot_postgres_password
+        POSTGRES_PASSWORD = local.secrets_values.penpot_postgres_password
         POSTGRES_DB       = "penpot"
       }
       volumes = ["penpot-postgres-data:/var/lib/postgresql/data"]
@@ -856,10 +935,10 @@ module "penpot" {
       depends_on = ["penpot-postgres", "penpot-redis"]
       environment = {
         PENPOT_DATABASE_URI      = "postgresql://penpot-postgres/penpot"
-        PENPOT_DATABASE_USERNAME = "penpot"
-        PENPOT_DATABASE_PASSWORD = random_password.penpot_postgres.result
+        PENPOT_DATABASE_USERNAME = local.secret_usernames.penpot_postgres_password
+        PENPOT_DATABASE_PASSWORD = local.secrets_values.penpot_postgres_password
         PENPOT_REDIS_URI         = "redis://penpot-redis/0"
-        PENPOT_SECRET_KEY        = random_password.penpot_secret_key.result
+        PENPOT_SECRET_KEY        = local.secrets_values.penpot_secret_key
         PENPOT_FLAGS             = local.penpot_flags
         PENPOT_PUBLIC_URI        = "https://penpot.${local.internal_domain}"
       }
@@ -872,7 +951,7 @@ module "penpot" {
       environment = {
         PENPOT_PUBLIC_URI = "https://penpot.${local.internal_domain}"
         PENPOT_REDIS_URI  = "redis://penpot-redis/0"
-        PENPOT_SECRET_KEY = random_password.penpot_secret_key.result
+        PENPOT_SECRET_KEY = local.secrets_values.penpot_secret_key
       }
     },
     {
@@ -1163,7 +1242,7 @@ locals {
     import json, urllib.request
     from http.server import BaseHTTPRequestHandler, HTTPServer
 
-    TOPIC = "${random_password.ntfy_alert_topic.result}"
+    TOPIC = "${local.secrets_values.ntfy_alert_topic}"
     NTFY = "http://ntfy/" + TOPIC
     PRIORITY = {"critical": "5", "warning": "3"}
     ICON = {"firing": "rotating_light", "resolved": "white_check_mark"}
@@ -1333,7 +1412,8 @@ module "monitoring" {
       image = "docker.io/grafana/grafana:latest"
       ports = ["3001:3000"]
       environment = {
-        GF_SECURITY_ADMIN_PASSWORD = random_password.grafana_admin.result
+        GF_SECURITY_ADMIN_USER     = local.secret_usernames.grafana_admin_password
+        GF_SECURITY_ADMIN_PASSWORD = local.secrets_values.grafana_admin_password
         GF_SERVER_ROOT_URL         = "https://grafana.${local.internal_domain}"
       }
       volumes = [
@@ -1419,8 +1499,8 @@ module "aspire" {
 locals {
   gitea_db_host = local.service_ips.postgres
   gitea_db_name = "giteadb"
-  gitea_db_user = "gitea"
-  gitea_db_pass = random_password.gitea_db.result
+  gitea_db_user = local.secret_usernames.gitea_db_password
+  gitea_db_pass = local.secrets_values.gitea_db_password
 
   # Run on the gitea VM itself; connects to the shared postgres VM over the
   # LAN as the postgres superuser (the role created by the postgres VM's
@@ -1432,12 +1512,12 @@ locals {
     # \$\$ was rejected by psql); uses ON_ERROR_STOP single statements and a
     # wait-for-postgres retry loop so first boot doesn't race postgres startup.
     set -e
-    export PGPASSWORD='${random_password.postgres.result}'
+    export PGPASSWORD='${local.secrets_values.postgres_password}'
     export PGCONNECT_TIMEOUT=5
 
     # Wait for postgres to accept connections (bounded) before provisioning.
     tries=0
-    until psql -h ${local.gitea_db_host} -U postgres -d postgres -c 'SELECT 1' >/dev/null 2>&1; do
+    until psql -h ${local.gitea_db_host} -U ${local.secret_usernames.postgres_password} -d postgres -c 'SELECT 1' >/dev/null 2>&1; do
       tries=$((tries + 1))
       if [ "$tries" -ge 30 ]; then
         echo "postgres at ${local.gitea_db_host} not ready after $tries attempts" >&2
@@ -1447,20 +1527,20 @@ locals {
     done
 
     # Create or update the gitea role (always (re)set the password).
-    psql -h ${local.gitea_db_host} -U postgres -d postgres -v ON_ERROR_STOP=1 \
+    psql -h ${local.gitea_db_host} -U ${local.secret_usernames.postgres_password} -d postgres -v ON_ERROR_STOP=1 \
       -c "CREATE ROLE ${local.gitea_db_user} LOGIN PASSWORD '${local.gitea_db_pass}'" \
-      || psql -h ${local.gitea_db_host} -U postgres -d postgres -v ON_ERROR_STOP=1 \
+      || psql -h ${local.gitea_db_host} -U ${local.secret_usernames.postgres_password} -d postgres -v ON_ERROR_STOP=1 \
       -c "ALTER ROLE ${local.gitea_db_user} WITH LOGIN PASSWORD '${local.gitea_db_pass}'"
 
     # Create the database if missing (CREATE DATABASE can't run in a DO block).
-    if ! psql -h ${local.gitea_db_host} -U postgres -d postgres -tAc \
+    if ! psql -h ${local.gitea_db_host} -U ${local.secret_usernames.postgres_password} -d postgres -tAc \
       "SELECT 1 FROM pg_database WHERE datname='${local.gitea_db_name}'" | grep -q 1; then
-      psql -h ${local.gitea_db_host} -U postgres -d postgres -v ON_ERROR_STOP=1 \
+      psql -h ${local.gitea_db_host} -U ${local.secret_usernames.postgres_password} -d postgres -v ON_ERROR_STOP=1 \
         -c "CREATE DATABASE ${local.gitea_db_name} OWNER ${local.gitea_db_user}"
     fi
 
     # Ensure ownership is correct even if the db pre-existed.
-    psql -h ${local.gitea_db_host} -U postgres -d postgres -v ON_ERROR_STOP=1 \
+    psql -h ${local.gitea_db_host} -U ${local.secret_usernames.postgres_password} -d postgres -v ON_ERROR_STOP=1 \
       -c "ALTER DATABASE ${local.gitea_db_name} OWNER TO ${local.gitea_db_user}"
   EOT
 }
@@ -1547,9 +1627,9 @@ module "gitea" {
         GITEA__server__SSH_DOMAIN       = "gitea.${local.internal_domain}"
         GITEA__server__SSH_PORT         = "2222"
         GITEA__security__INSTALL_LOCK   = "true"
-        GITEA__security__INTERNAL_TOKEN = random_password.gitea_internal_token.result
-        GITEA__security__SECRET_KEY     = random_password.gitea_secret_key.result
-        GITEA__oauth2__JWT_SECRET       = random_password.gitea_jwt_secret.result
+        GITEA__security__INTERNAL_TOKEN = local.secrets_values.gitea_internal_token
+        GITEA__security__SECRET_KEY     = local.secrets_values.gitea_secret_key
+        GITEA__oauth2__JWT_SECRET       = local.secrets_values.gitea_jwt_secret
         GITEA__log__LEVEL               = "Info"
       }
       # Bind mount, not a named volume: /var/lib/gitea is the NFS export on
@@ -1781,6 +1861,138 @@ module "nfs" {
         # Host bind mount (not named volume): we own /srv/nfs on the VM so
         # per-service export dirs have boot-time-controlled ownership.
         "/srv/nfs:/exports:Z",
+      ]
+    },
+    {
+      name  = "node-exporter"
+      image = "quay.io/prometheus/node-exporter:latest"
+      ports = ["9100:9100"]
+    },
+  ]
+}
+
+# ---------------------------------------------------------------------------
+# OpenBao secrets management — Transit-seal provider (openbao-transit-vm, .28)
+# Dedicated Shamir-sealed OpenBao; this is the root of trust the main cluster's
+# transit seal relies on. Operator unseals it manually after a transit-vm
+# reboot. See plans/openbao-deployment.md.
+# ---------------------------------------------------------------------------
+module "openbao_transit" {
+  source    = "./modules/vm"
+  providers = { libvirt = libvirt.vhost }
+
+  name             = "openbao-transit-vm"
+  pool_name        = libvirt_pool.vhost.name
+  base_volume_path = libvirt_volume.base_vhost.path
+  vcpu             = 1
+  memory_mib       = 512
+  disk_gib         = 5
+  bridge           = var.vhost_bridge
+  static_ip        = "${local.service_ips.openbao-transit}${var.vhost_lan_cidr_suffix}"
+  gateway          = var.vhost_gateway
+  dns              = local.vm_dns
+  firmware         = var.uefi_firmware
+  nvram_template   = var.uefi_nvram_template
+  vm_user          = var.vm_user
+  ssh_public_key   = trimspace(file(pathexpand(var.ssh_public_key_path)))
+
+  extra_files = [
+    { path = "/etc/infra/openbao-transit/transit.hcl", content = local.transit_config },
+    local.registry_mirror_file,
+    local.root_ca_anchor_file,
+  ]
+
+  containers = [
+    {
+      name    = "openbao-transit"
+      image   = "docker.io/openbao/openbao:2.6.2"
+      command = "bao server -config=/openbao/config/transit.hcl"
+      # Image's uid 100 can't write the root-owned mounted config/volume in
+      # some cases; run as root so the root-only config stays readable and the
+      # raft volume is writable (same rationale as other containers using 0).
+      user  = "0"
+      ports = ["8200:8200"]
+      volumes = [
+        "/etc/infra/openbao-transit/transit.hcl:/openbao/config/transit.hcl:Z",
+        "transit-data:/openbao",
+      ]
+      # IPC_LOCK lets raft mlock (openbao recommends it).
+      extra_args = ["--cap-add", "IPC_LOCK"]
+    },
+    {
+      name  = "node-exporter"
+      image = "quay.io/prometheus/node-exporter:latest"
+      ports = ["9100:9100"]
+    },
+  ]
+}
+
+# ---------------------------------------------------------------------------
+# OpenBao secrets management — Main cluster (openbao-vm, .27)
+# Single-node Raft, TLS via caddy (step-ca ACME for openbao.lab.internal),
+# auto-unseal via the transit provider above. See plans/openbao-deployment.md.
+# ---------------------------------------------------------------------------
+module "openbao" {
+  source    = "./modules/vm"
+  providers = { libvirt = libvirt.vhost }
+
+  name             = "openbao-vm"
+  pool_name        = libvirt_pool.vhost.name
+  base_volume_path = libvirt_volume.base_vhost.path
+  vcpu             = 2
+  memory_mib       = 2048
+  disk_gib         = 10
+  bridge           = var.vhost_bridge
+  static_ip        = "${local.service_ips.openbao}${var.vhost_lan_cidr_suffix}"
+  gateway          = var.vhost_gateway
+  dns              = local.vm_dns
+  firmware         = var.uefi_firmware
+  nvram_template   = var.uefi_nvram_template
+  vm_user          = var.vm_user
+  ssh_public_key   = trimspace(file(pathexpand(var.ssh_public_key_path)))
+
+  # caddy_extra_files.openbao supplies the generated Caddyfile + root_ca.crt +
+  # trust anchor + registry mirror for this VM (from local.caddy_sites). The
+  # openbao.hcl.tmpl is the template the runtime config-render step fills with
+  # the out-of-band transit token; it is NOT the final config path.
+  extra_files = concat(
+    local.caddy_extra_files.openbao,
+    [
+      { path = "/etc/infra/openbao/openbao.hcl.tmpl", content = local.openbao_config },
+    ],
+  )
+
+  containers = [
+    {
+      name  = "openbao"
+      image = "docker.io/openbao/openbao:2.6.2"
+      # The quadlet mounts the final config at /openbao/config/openbao.hcl (see
+      # the Volume below), so `bao server` reads it directly — no shell wrapper
+      # (quadlet Exec= quoting strips quotes and splits on spaces, so a `sh -c`
+      # image command would mis-parse). The operator materialises
+      # /etc/infra/openbao/openbao.hcl from openbao.hcl.tmpl via the runbook;
+      # the default template is Shamir (no seal block), so it starts cleanly.
+      command = "bao server -config=/openbao/config/openbao.hcl"
+      user    = "0"
+      ports   = ["8200:8200"]
+      volumes = [
+        "/etc/infra/openbao/openbao.hcl:/openbao/config/openbao.hcl:Z",
+        "openbao-data:/openbao",
+      ]
+      extra_args = ["--cap-add", "IPC_LOCK"]
+    },
+    {
+      name       = "caddy"
+      image      = "docker.io/library/caddy:latest"
+      ports      = ["80:80", "443:443"]
+      depends_on = ["openbao"]
+      # Pin ca.lab.internal so ACME works before/without internal DNS (same as
+      # the dns caddies).
+      extra_args = ["--add-host", "ca.lab.internal:192.168.70.18"]
+      volumes = [
+        "/etc/infra/Caddyfile:/etc/caddy/Caddyfile:Z",
+        "/etc/infra/root_ca.crt:/etc/caddy/root_ca.crt:Z",
+        "caddy-data:/data",
       ]
     },
     {

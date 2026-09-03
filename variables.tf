@@ -13,6 +13,7 @@ variable "tf_encryption_passphrase" {
   sensitive   = true
 }
 
+
 # Not a random_password: Gitea mints this token (Site Administration ->
 # Actions -> Runners -> Create new runner, on https://gitea.lab.internal)
 # and it must be pasted here out-of-band. Supply via
@@ -21,6 +22,24 @@ variable "gitea_runner_registration_token" {
   description = "Gitea Actions runner registration token, minted in the Gitea admin UI and supplied via TF_VAR_gitea_runner_registration_token"
   type        = string
   sensitive   = true
+}
+
+# OpenBao.
+#
+# The OpenBao root token is used ONCE (Phase A) by the vault provider to
+# wire userpass + operator policy + initial admin user. After apply, rotate
+# the root token via the recovery-key flow so the value in TF_VAR history
+# becomes useless. Sensitive so it is not echoed in plan output.
+variable "openbao_root_token" {
+  description = "OpenBao root token for (TF_VAR_openbao_root_token). Rotate via recovery-key flow after the Phase A apply succeeds."
+  type        = string
+  sensitive   = true
+}
+
+variable "openbao_admin_username" {
+  description = "Personal UI username (userpass) for the operator on OpenBao"
+  type        = string
+  default     = "chris"
 }
 
 variable "pool_name" {
