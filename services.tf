@@ -756,7 +756,7 @@ module "gitea_runner" {
       # Docker Hub (there is no floating "0.2" major tag; pulling it 404s
       # with manifest unknown). Version must satisfy the Gitea server's
       # minimum runner version (Gitea 1.x requires act_runner >= 0.2.x).
-      image = "docker.io/gitea/act_runner:0.2.13"
+      image = "docker.io/gitea/act_runner:3.3.2"
       # The gitea/act_runner image's ENTRYPOINT is `/sbin/tini -- run.sh`,
       # and run.sh ignores any CMD/Exec= args (it runs `act_runner daemon`
       # directly). To run a custom startup script we MUST override the
@@ -2002,4 +2002,3 @@ module "openbao" {
     },
   ]
 }
-
