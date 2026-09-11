@@ -19,6 +19,10 @@ locals {
     # dns.lab.internal is the stable name clients use for DNS resolution; it's
     # a CNAME to the load balancer (dns-lb) in front of the dns1/dns2 backends.
     dns = "dns-lb"
+    # gitea.lab.internal is a CNAME to the load balancer (gitea-lb) in front of
+    # the gitea-1/gitea-2 backends, same pattern as dns -> dns-lb. Runners,
+    # verdaccio, and clients all use gitea.lab.internal and now hit the LB.
+    gitea = "gitea-lb"
   }
 
   # Both CoreDNS VMs serve identical copies of the zone. They are the LB's

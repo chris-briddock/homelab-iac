@@ -27,6 +27,9 @@ No Ansible or remote-exec step — everything a VM needs ships in its cloud-init
   and defines the `libvirt_domain` (UEFI/q35, host-passthrough CPU, SPICE console).
 - `cloud-init/*.tmpl` — user-data (packages, quadlet container units, extra files)
   and network-config (DHCP or static IP) templates shared by every VM.
+- `grafana/dashboards/*.json` — Grafana dashboard models, auto-provisioned onto
+  the `monitoring` VM (file provider). Drop a JSON file here and `tofu apply`
+  ships it; see `grafana/dashboards/README.md`.
 - `scripts/vhost-proxy.sh` — unix-socket proxy to the vhost's libvirtd (see below).
 
 ## State backend + encryption

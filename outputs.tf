@@ -6,18 +6,23 @@ output "vm_ips" {
 output "service_ips" {
   description = "IPv4 addresses of the real services on the vhost (bridged LAN, DHCP-assigned)"
   value = {
-    surrealdb       = module.surrealdb.ipv4
-    postgres        = module.postgres.ipv4
-    qvault          = module.qvault.ipv4
-    penpot          = module.penpot.ipv4
-    monitoring      = module.monitoring.ipv4
-    aspire          = module.aspire.ipv4
-    dns-lb          = module.dns_lb.ipv4
-    dns1            = module.dns["dns1"].ipv4
-    dns2            = module.dns["dns2"].ipv4
-    ca              = module.ca.ipv4
-    registry        = module.registry.ipv4
-    gitea           = module.gitea.ipv4
+    surrealdb  = module.surrealdb.ipv4
+    postgres   = module.postgres.ipv4
+    qvault     = module.qvault.ipv4
+    penpot     = module.penpot.ipv4
+    monitoring = module.monitoring.ipv4
+    aspire     = module.aspire.ipv4
+    dns-lb     = module.dns_lb.ipv4
+    dns1       = module.dns["dns1"].ipv4
+    dns2       = module.dns["dns2"].ipv4
+    ca         = module.ca.ipv4
+    registry   = module.registry.ipv4
+    # gitea is now active-active behind gitea-lb: gitea.lab.internal (a CNAME to
+    # gitea-lb) is the stable client-facing name; the two backends are listed
+    # individually for ops/diagnostics.
+    gitea-lb        = module.gitea_lb.ipv4
+    gitea-1         = module.gitea["gitea-1"].ipv4
+    gitea-2         = module.gitea["gitea-2"].ipv4
     verdaccio       = module.verdaccio.ipv4
     nfs             = module.nfs.ipv4
     redis           = module.redis.ipv4

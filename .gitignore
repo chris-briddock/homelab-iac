@@ -1,3 +1,7 @@
+# Local .env file — holds PG_CONN_STR (DB password), state encryption
+# passphrase, OpenBao root token, gitea runner token. Never commit.
+.env
+
 # Local .terraform directories
 **/.terraform/*
 
@@ -42,3 +46,8 @@ pki/*.srl
 
 # OpenBao bootstrap artifacts (root/recovery keys) - never commit
 .openbao-custody/
+
+# tar files
+*.tar
+
+/plans

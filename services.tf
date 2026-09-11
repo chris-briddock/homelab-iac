@@ -9,11 +9,17 @@ locals {
     # dns1/dns2 are the two CoreDNS backends (were dns/dns2). dns.lab.internal
     # is now the load-balancer in front of them (see infra.tf module dns_lb);
     # the dns1 backend is CNAME'd from the old `dns` name for DoH back-compat.
-    dns1      = "192.168.70.16"
-    registry  = "192.168.70.17"
-    ca        = "192.168.70.18"
-    dns2      = "192.168.70.19"
-    gitea     = "192.168.70.20"
+    dns1     = "192.168.70.16"
+    registry = "192.168.70.17"
+    ca       = "192.168.70.18"
+    dns2     = "192.168.70.19"
+    # gitea is now TWO active-active instances (gitea-1/gitea-2) behind a
+    # dedicated Caddy load-balancer VM (gitea-lb). gitea.lab.internal is a CNAME
+    # to gitea-lb (infra.tf dns_cname_records), same pattern as dns -> dns-lb.
+    # The old single `gitea` A record is gone; gitea-1 keeps .20 (was gitea-vm).
+    gitea-1   = "192.168.70.20"
+    gitea-2   = "192.168.70.30"
+    gitea-lb  = "192.168.70.29"
     verdaccio = "192.168.70.21"
     nfs       = "192.168.70.22"
     redis     = "192.168.70.23"
@@ -67,11 +73,21 @@ locals {
         insecure       = false
         fetch_timeout  = "10s"
         fetch_interval = "2s"
-        # ubuntu-latest resolves to the node image below; default is empty
-        # (jobs must then pin container.image explicitly).
+        # ubuntu-latest/24.04 map to upstream node:24. The node24-lab labels
+        # point at the custom CA-baked image (registry.lab.internal/ci/node:
+        # 24-lab) for workflows that declare their OWN container: image —
+        # act_runner does NOT merge daemon-level container.envs/options into
+        # workflow-declared containers, so env injection (GIT_SSL_CAINFO etc.
+        # below) can't reach those jobs; baking the lab CA into the image's
+        # system trust store + NODE_EXTRA_CA_CERTS makes TLS to
+        # gitea.lab.internal work with zero injection. Workflows opt in with
+        #   runs-on: node24-lab
+        # ...and by setting their job's container.image to the same tag (the
+        # label must RESOLVE to the pullable image).
         labels = [
           "ubuntu-latest:docker://docker.io/library/node:24",
           "ubuntu-24.04:docker://docker.io/library/node:24",
+          "node24-lab:docker://registry.lab.internal/ci/node:24-lab",
         ]
       }
       cache = {
@@ -80,9 +96,16 @@ locals {
         host_workdir_parent = "/data/workdirs"
       }
       container = {
-        # Total isolation: no socket/exec forwarding from job containers to
-        # the daemon. Jobs that need docker-in-docker won't work -- use a
-        # service container with the dind image instead.
+        # Job containers are unprivileged, but the rootful podman socket is
+        # bind-mounted in (see options below + the /var/run/docker.sock
+        # symlink in extra_runcmd) so jobs that shell out to `docker` (e.g.
+        # trufflehog's docker-based action) can reach the daemon. The socket
+        # uses :z (shared SELinux label) not :Z (private) because up to 4
+        # jobs (runner.capacity) can run concurrently and each needs access
+        # to the same socket inode -- :Z would relabel it per-container and
+        # block the others. docker_host="-" leaves DOCKER_HOST unset in job
+        # containers so the Docker CLI/SDK defaults to
+        # unix:///var/run/docker.sock (the path the socket is mounted at).
         privileged = false
         # Bind the lab CA bundle (root + intermediate, written by cloud-init
         # on the runner VM) into every job container read-only. Job images
@@ -93,7 +116,15 @@ locals {
         # ":Z" is required on SELinux hosts: without it podman mounts the
         # host file with a label the container can't read and git's libcurl
         # fails with "Problem with the SSL CA cert (path? access rights?)".
-        options        = "-v /var/lib/act_runner/ca/lab-ca-bundle.crt:/etc/ssl/certs/lab-ca-bundle.crt:ro,Z"
+        # The docker socket mount uses :z (shared) instead -- see the
+        # privileged comment above for why a private :Z label breaks
+        # concurrent jobs sharing one socket inode.
+        # NOTE: sibling-container SELinux MCS isolation is handled daemon-wide
+        # via /etc/containers/containers.conf (label=false) in extra_files
+        # below -- see that file's comment for why a per-job --security-opt
+        # here cannot fix it (the sibling spawned by `docker run` in a job
+        # step does not inherit this option).
+        options        = "-v /var/lib/act_runner/ca/lab-ca-bundle.crt:/etc/ssl/certs/lab-ca-bundle.crt:ro,Z -v /var/run/docker.sock:/var/run/docker.sock:z"
         workdir_parent = null
         valid_volumes  = []
         docker_host    = "-"
@@ -167,7 +198,10 @@ locals {
     aspire     = { aspire = "aspire-dashboard:18888" }
     # registry is NOT here: it has a custom Caddyfile (registry_caddyfile)
     # with path-routing to multiple backend instances (writable + 4 caches).
-    gitea     = { gitea = "gitea:3000" }
+    # gitea is NOT here: it now has its own dedicated LB VM (module.gitea_lb)
+    # that terminates TLS and round-robins to the two gitea backends. The
+    # backends no longer run a per-VM caddy, so no Caddyfile is generated for
+    # them here (caddyfiles + caddy_extra_files both derive from these keys).
     verdaccio = { verdaccio = "verdaccio:4873" }
     # OpenBao main cluster: caddy terminates openbao.lab.internal and proxies
     # to the openbao container's API on :8200 (plaintext inside vmnet; TLS at
@@ -591,9 +625,25 @@ module "postgres" {
 # random password is still required on top of TLS.
 # ---------------------------------------------------------------------------
 locals {
+  # Redis listens on TWO ports:
+  #   - tls-port 6379: TLS (self-signed cert). Used by redis-exporter, which
+  #     connects via `rediss://redis:6379 --skip-tls-verification` (sibling
+  #     container, container-name DNS). Kept because the exporter's TLS-skip
+  #     flag works cleanly.
+  #   - port 6380: plaintext, still password-protected. Used by Gitea's
+  #     session (redigo) + cache (go-redis) adapters. Gitea's redis adapters
+  #     do NOT expose a TLS-skip-verify knob that go-redis honors (verified:
+  #     `rediss://` enables TLS but x509 verification fails against the
+  #     self-signed cert with no way to skip, and the comma-format `ssl=true`
+  #     is ignored -> EOF). Rather than re-mint the cert under the lab root CA
+  #     AND fix go-redis's root-pool loading, a plaintext listener on the
+  #     private LAN is the pragmatic choice -- the password is the trust
+  #     boundary (see comment on the cert below), and the LAN is isolated.
   redis_conf = <<-EOT
-    # No plaintext listener: TLS is the only way in.
-    port 0
+    # Plaintext listener for LAN clients that can't do TLS-skip-verify
+    # (Gitea's redis adapters). Still password-protected; private LAN only.
+    port 6380
+    # TLS listener for clients that skip verification (redis-exporter).
     tls-port 6379
     bind 0.0.0.0
     protected-mode yes
@@ -655,9 +705,12 @@ module "redis" {
 
   containers = [
     {
-      name    = "redis"
-      image   = "docker.io/library/redis:7"
-      ports   = ["6379:6379"]
+      name  = "redis"
+      image = "docker.io/library/redis:7"
+      # 6379 = TLS listener (redis-exporter via rediss://); 6380 = plaintext
+      # listener (Gitea session/cache, which can't do TLS-skip-verify). Both
+      # require the password; see local.redis_conf for the rationale.
+      ports   = ["6379:6379", "6380:6380"]
       command = "redis-server /etc/redis/redis.conf"
       volumes = [
         "/etc/infra/redis/redis.conf:/etc/redis/redis.conf:Z",
@@ -735,6 +788,105 @@ module "gitea_runner" {
       path    = "/etc/infra/ca/lab-internal-intermediate-ca.crt"
       content = local.intermediate_ca_cert_pem
     },
+    # podman-tcp.socket/.service: a SECOND podman API listener, TCP on the
+    # rootful vmnet bridge gateway (10.89.0.1:2375). Job containers are
+    # rootful siblings of the act-runner container, so they can't reach
+    # /run/podman/podman.sock inside the act-runner's mount namespace -- and
+    # act_runner ignores the daemon-level container.options that would
+    # bind-mount it into jobs. This TCP endpoint is how jobs that shell out
+    # to `docker` (e.g. trufflehog's composite action) reach the daemon; the
+    # ci/node:24-lab image ships a docker->podman-remote shim pre-connected
+    # to tcp://10.89.0.1:2375. Unauthenticated, but only reachable from
+    # containers on the runner VM's own rootful bridge -- the same trust
+    # domain as the --privileged act-runner daemon itself.
+    #
+    # This MUST be a separate socket+service pair: podman system service
+    # supports exactly ONE socket-activation fd ("wrong number of file
+    # descriptors for socket activation protocol (2 != 1)" if a drop-in adds
+    # a second ListenStream to the stock podman.socket).
+    { path = "/etc/systemd/system/podman-tcp.socket", content = <<-EOT
+        [Unit]
+        Description=Podman API Socket (TCP on vmnet bridge for CI jobs)
+
+        [Socket]
+        ListenStream=10.89.0.1:2375
+
+        [Install]
+        WantedBy=sockets.target
+      EOT
+    },
+    { path = "/etc/systemd/system/podman-tcp.service", content = <<-EOT
+        [Unit]
+        Description=Podman API Service (TCP)
+        Requires=podman-tcp.socket
+        After=podman-tcp.socket
+        StartLimitIntervalSec=0
+
+        [Service]
+        Type=exec
+        KillMode=process
+        ExecStart=/usr/bin/podman --log-level=info system service
+
+        [Install]
+        WantedBy=multi-user.target
+      EOT
+    },
+    # tmpfiles.d entry: symlink /run/docker.sock -> /run/podman/podman.sock so
+    # job containers that shell out to `docker` (e.g. trufflehog's composite
+    # action) find a Docker daemon at the canonical unix:///var/run/docker.sock
+    # path. /var/run is a symlink to /run on Fedora, so /var/run/docker.sock and
+    # /run/docker.sock are the same path. Delivered via extra_files (not
+    # extra_runcmd) because the sync script's file-write path is reliable while
+    # its runcmd runner had issues with the `sh -c 'ln -sf ...'` form. The
+    # `L+` type forcefully creates/replaces the symlink (handles the case where
+    # the path pre-exists as a regular file). systemd-tmpfiles-setup.service
+    # processes this on every boot, so the symlink survives reboots even though
+    # /run is a tmpfs. The `systemd-tmpfiles --create` runcmd below activates
+    # it immediately on first boot / live sync (the socket file itself is
+    # created by podman.socket, which is enabled in the same runcmd block).
+    {
+      path    = "/etc/tmpfiles.d/podman-docker-socket.conf"
+      content = "L+ /run/docker.sock - - - - /run/podman/podman.sock\n"
+    },
+    # SELinux MCS isolation OFF for the rootful podman daemon on the runner VM.
+    # act_runner mounts each job's per-job workspace (under host_workdir_parent)
+    # with :Z, which podman relabels to the JOB container's private Multi-
+    # Category Security (MCS) category (e.g. s0:c364,c774). A job step that
+    # spawns a SIBLING container through the shared docker socket -- TruffleHog's
+    # composite action runs `docker run -v .:/tmp -w /tmp` -- creates a
+    # container with NO --security-opt, so podman assigns it a DIFFERENT random
+    # private MCS category. SELinux then denies the sibling's writes to the
+    # workspace even though it runs as root (root bypasses DAC but never MAC):
+    #   "failed to create temporary clone path: mkdir /tmp/trufflehog-...:
+    #    permission denied"
+    # A per-job --security-opt in act_runner's container.options does NOT fix
+    # this, because the option applies to the JOB container only and is NOT
+    # inherited by the sibling the job spawns via `docker run`. The only lever
+    # that covers every sibling (without editing every workflow/action) is the
+    # daemon default: `label = false` in [containers] makes the rootful podman
+    # daemon skip MCS labeling for ALL containers it creates -- jobs and their
+    # siblings alike -- so the :Z-relabelled workspace keeps the host's label
+    # (container_file_t with no private categories) and any sibling can write
+    # to it. Type enforcement (container_t) is preserved; only inter-container
+    # MCS separation is dropped. This is acceptable here because the runner is
+    # already a single trust domain: job containers share the --privileged
+    # act-runner daemon's rootful podman socket by design (see container.options
+    # + the podman-tcp.socket above), so they can already trivially escape
+    # into each other via that socket -- MCS was never a meaningful boundary on
+    # these VMs. (containers.conf is read by every podman invocation including
+    # `podman system service` over the TCP socket and the unix socket daemon,
+    # so a daemon restart is added in extra_runcmd to drop any cached labels.)
+    { path = "/etc/containers/containers.conf", content = <<-EOT
+        # Managed by OpenTofu (module.gitea_runner). Drops SELinux MCS
+        # (Multi-Category Security) separation for containers created by this
+        # host's rootful podman daemon, so sibling containers spawned by CI job
+        # steps (e.g. TruffleHog's `docker run -v .:/tmp`) can read+write the
+        # job's :Z-relabelled workspace. See services.tf extra_files comment.
+        # Type enforcement (container_t) stays on; only MCS categories are off.
+        [containers]
+        label = false
+      EOT
+    },
   ]
 
   # Rootful podman.socket provides the Docker API act_runner uses to spawn
@@ -742,21 +894,51 @@ module "gitea_runner" {
   # cloud-init (vm module) as rootless -- that is podman's default unit
   # target. The socket unit is the only rootful moving part.
   extra_runcmd = [
-    ["systemctl", "enable", "--now", "podman.socket"],
+    ["systemctl", "daemon-reload"],
+    ["systemctl", "enable", "--now", "podman.socket", "podman-tcp.socket"],
     # act_runner spawns jobs by bind-mounting a workdir from the *host*
     # (see container.options); pre-create it with _netdev-less tmpfs-free
     # perms so a fresh VM has a stable parent for job containers.
     ["mkdir", "-p", "/var/lib/act_runner/workdirs", "/var/lib/act_runner/cache", "/var/lib/act_runner/ca"],
+    # Activate the /run/docker.sock -> /run/podman/podman.sock symlink
+    # declared in the tmpfiles.d entry above (extra_files). systemd-tmpfiles
+    # --create processes the conf immediately (it also runs at boot via
+    # systemd-tmpfiles-setup.service). MUST come after podman.socket is
+    # enabled+started so /run/podman/podman.sock exists; `L+` in tmpfiles.d
+    # would create a dangling symlink otherwise (it is created atomically on
+    # the next --create after podman.socket comes up, which is fine).
+    ["systemd-tmpfiles", "--create", "/etc/tmpfiles.d/podman-docker-socket.conf"],
+    # /etc/containers/containers.conf (label=false, written above) is read by
+    # podman at config-load time. The rootful podman.socket / podman-tcp.socket
+    # service handlers read it per-request, but restart them anyway to be
+    # certain no container created after this point keeps a cached private MCS
+    # label (the whole point of the change). Cheap and idempotent.
+    ["systemctl", "restart", "podman.socket", "podman-tcp.socket"],
+    # Restart act_runner so it re-reads the updated config.yaml (the new
+    # container.options that bind-mounts /var/run/docker.sock into job
+    # containers). act_runner loads its config once at daemon startup; the
+    # sync script writes the new config.yaml in Phase 1 but only restarts
+    # containers whose QUADLET changed in Phase 5 -- the act-runner quadlet
+    # spec (image/env/volumes/extra_args) is unchanged, so without this
+    # explicit restart the daemon keeps running with the old config and job
+    # containers still miss the socket. Uses `podman restart` (not
+    # `systemctl restart`) because the quadlet sets RefuseManualStop=yes,
+    # which blocks systemd's stop/restart path; podman restart bypasses
+    # that gate (same pattern as the sync script's restart_container()).
+    # The `|| true` appended by the sync script's runcmd runner makes this
+    # safe on first boot (act-runner may not be up yet when cloud-init
+    # runs runcmd before containers start).
+    ["podman", "restart", "act-runner"],
   ]
 
   containers = [
     {
       name = "act-runner"
-      # Pinned x.y.z tag -- gitea/act_runner publishes only x.y.z + latest on
-      # Docker Hub (there is no floating "0.2" major tag; pulling it 404s
-      # with manifest unknown). Version must satisfy the Gitea server's
-      # minimum runner version (Gitea 1.x requires act_runner >= 0.2.x).
-      image = "docker.io/gitea/act_runner:3.3.2"
+      # "3.3.2" (a prior bump) does not exist on Docker Hub -- act_runner's
+      # own releases top out at 0.6.x; that tag conflated the Gitea *server*
+      # version with the act_runner *image* tag and 404s with "manifest
+      # unknown". Using the dind variant of the floating "latest" tag instead.
+      image = "docker.io/gitea/act_runner:latest-dind"
       # The gitea/act_runner image's ENTRYPOINT is `/sbin/tini -- run.sh`,
       # and run.sh ignores any CMD/Exec= args (it runs `act_runner daemon`
       # directly). To run a custom startup script we MUST override the
@@ -780,7 +962,11 @@ module "gitea_runner" {
       # + "Runner registered successfully". Without it the error was
       # "tls: failed to verify certificate: x509: certificate signed by
       # unknown authority".
-      command = "-c 'cat /etc/ssl/certs/ca-certificates.crt /usr/local/share/ca-certificates/lab-internal-root-ca.crt /usr/local/share/ca-certificates/lab-internal-intermediate-ca.crt > /tmp/lab-ca-bundle.crt; act_runner register --no-interactive --instance https://gitea.${local.internal_domain} --token ${var.gitea_runner_registration_token} --name ${each.key} --labels ubuntu-latest:docker://docker.io/library/node:24 --config /etc/act_runner/config.yaml || true; exec act_runner daemon --config /etc/act_runner/config.yaml'"
+      # NOTE: no --labels here -- the daemon ignores command-line labels in
+      # favour of the config file's runner.labels (it logs "Labels from
+      # command will be ignored, use labels defined in config file"), so the
+      # list in local.act_runner_config is the single source of truth.
+      command = "-c 'cat /etc/ssl/certs/ca-certificates.crt /usr/local/share/ca-certificates/lab-internal-root-ca.crt /usr/local/share/ca-certificates/lab-internal-intermediate-ca.crt > /tmp/lab-ca-bundle.crt; act_runner register --no-interactive --instance https://gitea.${local.internal_domain} --token ${var.gitea_runner_registration_token} --name ${each.key} --config /etc/act_runner/config.yaml || true; exec act_runner daemon --config /etc/act_runner/config.yaml'"
       environment = {
         CONFIG_FILE   = "/etc/act_runner/config.yaml"
         SSL_CERT_FILE = "/tmp/lab-ca-bundle.crt"
@@ -1025,7 +1211,10 @@ locals {
     "${local.service_ips.postgres}:5432",
     "${local.service_ips.surrealdb}:8000",
     "${local.service_ips.nfs}:2049",
-    "${local.service_ips.gitea}:2222",
+    # git-over-SSH now terminates at the gitea-lb VM's :2222 (L4 round-robin
+    # to the backends), so probe the LB endpoint -- this catches an LB outage
+    # OR both backends down, which is the actionable failure.
+    "${local.service_ips.gitea-lb}:2222",
     "${local.service_ips.redis}:6379",
   ]
 
@@ -1072,7 +1261,9 @@ locals {
               - "${local.service_ips.dns2}:9100"
               - "${local.service_ips.ca}:9100"
               - "${local.service_ips.registry}:9100"
-              - "${local.service_ips.gitea}:9100"
+              - "${local.service_ips.gitea-1}:9100"
+              - "${local.service_ips.gitea-2}:9100"
+              - "${local.service_ips.gitea-lb}:9100"
               - "${local.service_ips.verdaccio}:9100"
               - "${local.service_ips.nfs}:9100"
               - "${local.service_ips.redis}:9100"
@@ -1298,7 +1489,44 @@ locals {
         access: proxy
         url: http://prometheus:9090
         isDefault: true
+        # Pinned uid so provisioned dashboards can reference the datasource by
+        # a stable id ({ "type": "prometheus", "uid": "prometheus" }) instead
+        # of the random uid Grafana would otherwise assign on first import.
+        uid: prometheus
   YAML
+
+  # Grafana dashboard provisioning. The file provider watches a directory and
+  # (re)imports any *.json dashboard model it finds, every updateIntervalSeconds.
+  # allowUiUpdates:false keeps the on-disk JSON authoritative -- edits made in
+  # the UI can be saved as a copy but the provisioned dashboard always reverts
+  # to the file. Drop any Grafana dashboard JSON into grafana/dashboards/ in
+  # this repo and `tofu apply` ships it to the VM (see grafana_dashboard_files).
+  grafana_dashboards_provider = <<-YAML
+    apiVersion: 1
+    providers:
+      - name: infra
+        orgId: 1
+        folder: Infra
+        type: file
+        disableDeletion: false
+        allowUiUpdates: false
+        updateIntervalSeconds: 30
+        options:
+          path: /etc/grafana/dashboards
+          foldersFromFilesStructure: false
+  YAML
+
+  # Every dashboard model committed under grafana/dashboards/. Each becomes an
+  # extra_file on the monitoring VM at /etc/monitoring/grafana-dashboards/<f>,
+  # and that directory is bind-mounted to the provider's `path` above.
+  grafana_dashboard_files = fileset("${path.module}/grafana/dashboards", "*.json")
+
+  grafana_dashboard_extra_files = [
+    for f in local.grafana_dashboard_files : {
+      path    = "/etc/monitoring/grafana-dashboards/${f}"
+      content = file("${path.module}/grafana/dashboards/${f}")
+    }
+  ]
 }
 
 module "monitoring" {
@@ -1335,11 +1563,15 @@ module "monitoring" {
       { path = "/etc/monitoring/ntfy-server.yml", content = local.ntfy_config },
       { path = "/etc/monitoring/ntfy-shim.py", content = local.ntfy_shim_py, permissions = "0755" },
       { path = "/etc/monitoring/grafana-datasource.yml", content = local.grafana_datasource },
+      { path = "/etc/monitoring/grafana-dashboards.yml", content = local.grafana_dashboards_provider },
       # The blackbox exporter needs the lab root CA to trust step-ca-issued
       # TLS certs on the services it probes. Mounting the same file used for
       # the OS trust store keeps it one source of truth.
       { path = "/etc/monitoring/root_ca.crt", content = local.root_ca_cert_pem },
     ],
+    # One file per dashboard model under grafana/dashboards/; the whole
+    # directory is bind-mounted into the grafana container below.
+    local.grafana_dashboard_extra_files,
     local.caddy_extra_files.monitoring,
   )
 
@@ -1418,6 +1650,10 @@ module "monitoring" {
       }
       volumes = [
         "/etc/monitoring/grafana-datasource.yml:/etc/grafana/provisioning/datasources/prometheus.yml:Z",
+        # Dashboard provisioning: the provider config points at /etc/grafana/dashboards,
+        # which is the committed grafana/dashboards/ directory shipped via extra_files.
+        "/etc/monitoring/grafana-dashboards.yml:/etc/grafana/provisioning/dashboards/infra.yml:Z",
+        "/etc/monitoring/grafana-dashboards:/etc/grafana/dashboards:Z",
         "grafana-data:/var/lib/grafana",
       ]
     },
@@ -1492,15 +1728,52 @@ module "aspire" {
 }
 
 # ---------------------------------------------------------------------------
-# Uses the standalone Postgres VM (192.168.70.11) as its DB. An init sidecar
-# creates the `giteadb` database on first boot; the server container then
-# Gitea-migrates its own schema on startup.
+# Gitea: active-active HA. TWO instances (gitea-1/gitea-2) behind a dedicated
+# Caddy load-balancer VM (gitea-lb, see module.gitea_lb). Both instances share:
+#   - Postgres (giteadb on the postgres VM) -- already multi-instance-safe.
+#   - NFS (/var/lib/gitea -> nfs-vm:/gitea -> container /data) -- shared repos.
+#   - Secrets (internal_token/secret_key/jwt_secret from OpenBao).
+#   - Redis (the redis VM, TLS) for sessions + cache, so a user logged in on
+#     one backend stays logged in when the LB sends the next request to the
+#     other. Without shared sessions, active-active round-robin logs users out
+#     on every other request.
+# An init sidecar creates the `giteadb` database on first boot (idempotent, so
+# both instances running it is safe); the server container then Gitea-migrates
+# its own schema on startup.
 # ---------------------------------------------------------------------------
 locals {
   gitea_db_host = local.service_ips.postgres
   gitea_db_name = "giteadb"
   gitea_db_user = local.secret_usernames.gitea_db_password
   gitea_db_pass = local.secrets_values.gitea_db_password
+
+  # The two active-active Gitea backends. gitea-1 keeps .20 (was the single
+  # gitea-vm); gitea-2 is .30. gitea-lb (.29) is defined separately in
+  # module.gitea_lb.
+  gitea_vms = {
+    gitea-1 = local.service_ips.gitea-1
+    gitea-2 = local.service_ips.gitea-2
+  }
+
+  # Redis session + cache provider config for Gitea. Gitea connects to the
+  # redis VM's PLAINTEXT listener on :6380 (see local.redis_conf): the redis
+  # VM runs a self-signed TLS listener on :6379 for redis-exporter (which
+  # honors --skip-tls-verification), but Gitea's redis adapters do NOT expose
+  # a TLS-skip-verify knob that go-redis/redigo honor (verified: `rediss://`
+  # enables TLS but x509 verification fails against the self-signed cert with
+  # no skip path; the comma-format `ssl=true` is ignored -> EOF). A plaintext
+  # listener on the private, password-protected LAN is the pragmatic fix --
+  # the password is the trust boundary (the TLS cert was never the boundary;
+  # see the cert comment in module.redis), and the LAN is isolated. Sessions
+  # use db 1, cache db 2, to avoid colliding with other redis consumers on
+  # db 0. Session provider = redigo INI form (addrs / password / db); cache
+  # adapter = go-redis URL form (redis:// URL -- note the `redis://` scheme,
+  # NOT `rediss://`, so NO TLS).
+  gitea_redis_pass              = local.secrets_values.redis_password
+  gitea_redis_host              = local.service_ips.redis
+  gitea_session_provider_config = "addrs=${local.gitea_redis_host}:6380 db=1 password=${local.gitea_redis_pass}"
+  gitea_cache_host              = "redis://:${local.gitea_redis_pass}@${local.gitea_redis_host}:6380/2"
+  gitea_queue_conn_str          = "redis://:${local.gitea_redis_pass}@${local.gitea_redis_host}:6380/3"
 
   # Run on the gitea VM itself; connects to the shared postgres VM over the
   # LAN as the postgres superuser (the role created by the postgres VM's
@@ -1549,7 +1822,11 @@ module "gitea" {
   source    = "./modules/vm"
   providers = { libvirt = libvirt.vhost }
 
-  name             = "gitea-vm"
+  # Active-active: two identical instances behind module.gitea_lb. Both share
+  # the same Postgres DB, NFS /data, secrets, and Redis session/cache store.
+  for_each = local.gitea_vms
+
+  name             = "${each.key}-vm"
   pool_name        = libvirt_pool.vhost.name
   base_volume_path = libvirt_volume.base_vhost.path
   vcpu             = 2
@@ -1559,7 +1836,7 @@ module "gitea" {
   # shared postgres VM, so a small root disk is all the VM needs.
   disk_gib       = 5
   bridge         = var.vhost_bridge
-  static_ip      = "${local.service_ips.gitea}${var.vhost_lan_cidr_suffix}"
+  static_ip      = "${each.value}${var.vhost_lan_cidr_suffix}"
   gateway        = var.vhost_gateway
   dns            = local.vm_dns
   firmware       = var.uefi_firmware
@@ -1571,6 +1848,11 @@ module "gitea" {
   # below; the gitea container's data dir lives on the nfs VM.
   extra_packages = ["nfs-utils"]
 
+  # No Caddyfile/root_ca.crt here any more: TLS is terminated by the dedicated
+  # gitea-lb VM, not inside each backend. The backends serve plain HTTP on
+  # :3000 (and SSH on :2222). The root CA anchor IS still shipped: backends
+  # pull the gitea image via the lab registry cache (step-ca cert), so the
+  # trust store must still validate it on image pull.
   extra_files = concat(
     [
       { path = "/etc/infra/gitea/init-db.sh", content = local.gitea_init_script, permissions = "0755" },
@@ -1581,8 +1863,9 @@ module "gitea" {
         # name + .service), i.e. gitea.service -- NOT podman-gitea.service.
         content = "${local.service_ips.nfs}:/gitea /var/lib/gitea nfs4 rw,hard,intr,noatime,_netdev,x-systemd.automount,x-systemd.idle-timeout=600,x-systemd.before=gitea.service 0 0\n"
       },
+      local.root_ca_anchor_file,
+      local.registry_mirror_file,
     ],
-    local.caddy_extra_files.gitea,
   )
 
   extra_runcmd = [
@@ -1601,7 +1884,9 @@ module "gitea" {
     {
       # Oneshot bootstrap: creates the gitea role + database on the shared
       # postgres VM. The postgres image's `psql` is enough; we connect over
-      # the LAN to the postgres VM:5432.
+      # the LAN to the postgres VM:5432. Idempotent (CREATE ... || ALTER, and
+      # a pg_database guard), so it's safe for BOTH instances to run it -- the
+      # second is a no-op once the first has created the role/db.
       name       = "gitea-db-init"
       image      = "docker.io/library/postgres:16"
       command    = "/etc/infra/gitea/init-db.sh"
@@ -1612,16 +1897,26 @@ module "gitea" {
     {
       name  = "gitea"
       image = "docker.io/gitea/gitea:1"
-      # Host port 2222 forwards to the container's sshd on port 22.
-      # Gitea itself only listens on 3000 (HTTP) and 22 (SSH) inside the container.
-      ports      = ["2222:22"]
+      # Publish BOTH the HTTP (3000) and SSH (2222) ports to the host: the
+      # gitea-lb VM is on a SEPARATE VM and reaches the backends via their host
+      # IPs (192.168.70.20/.30:3000 for reverse_proxy, :2222 for L4 SSH). The
+      # old single-gitea layout had Caddy inside the same VM using container-
+      # name DNS on a shared podman network, so it could reach gitea:3000
+      # without host publishing -- that no longer applies with an external LB.
+      # Host 2222 -> container 22 (gitea sshd); host 3000 -> container 3000.
+      ports      = ["2222:22", "3000:3000"]
       depends_on = ["gitea-db-init"]
       environment = {
-        GITEA__database__DB_TYPE        = "postgres"
-        GITEA__database__HOST           = "${local.gitea_db_host}:5432"
-        GITEA__database__NAME           = local.gitea_db_name
-        GITEA__database__USER           = local.gitea_db_user
-        GITEA__database__PASSWD         = local.gitea_db_pass
+        GITEA__database__DB_TYPE = "postgres"
+        GITEA__database__HOST    = "${local.gitea_db_host}:5432"
+        GITEA__database__NAME    = local.gitea_db_name
+        GITEA__database__USER    = local.gitea_db_user
+        GITEA__database__PASSWD  = local.gitea_db_pass
+        # DOMAIN/ROOT_URL/SSH_DOMAIN are the PUBLIC LB hostname on BOTH
+        # instances: Gitea generates external clone/clone URLs from these, so
+        # they must be the client-facing name (gitea.lab.internal), not the
+        # per-backend name. PROTOCOL is http -- TLS terminates at the LB.
+        GITEA__server__PROTOCOL         = "http"
         GITEA__server__DOMAIN           = "gitea.${local.internal_domain}"
         GITEA__server__ROOT_URL         = "https://gitea.${local.internal_domain}/"
         GITEA__server__SSH_DOMAIN       = "gitea.${local.internal_domain}"
@@ -1630,20 +1925,211 @@ module "gitea" {
         GITEA__security__INTERNAL_TOKEN = local.secrets_values.gitea_internal_token
         GITEA__security__SECRET_KEY     = local.secrets_values.gitea_secret_key
         GITEA__oauth2__JWT_SECRET       = local.secrets_values.gitea_jwt_secret
-        GITEA__log__LEVEL               = "Info"
+        # Sessions + cache + queues in the shared Redis VM so a login on one
+        # backend is honored on the other (active-active round-robin), and so
+        # the internal queue/indexer state is shared without local LevelDB
+        # file locks (which deadlock over the shared NFS /data -- see the
+        # gitea_queue_conn_str local). Redis is reached over the plaintext
+        # :6380 listener (see local.redis_conf). Sessions -> db 1, cache ->
+        # db 2, queues -> db 3 (see locals).
+        GITEA__session__PROVIDER        = "redis"
+        GITEA__session__PROVIDER_CONFIG = local.gitea_session_provider_config
+        GITEA__cache__ADAPTER           = "redis"
+        GITEA__cache__HOST              = local.gitea_cache_host
+        # Queues -> Redis (db 3): avoids the LevelDB-on-NFS flock deadlock
+        # that crashes the second instance on startup.
+        GITEA__queue__TYPE     = "redis"
+        GITEA__queue__CONN_STR = local.gitea_queue_conn_str
+        # Issue indexer -> DB-backed (not local Bleve files): avoids another
+        # NFS-shared-state file-lock conflict between the two instances.
+        GITEA__indexer__ISSUE_INDEXER_TYPE = "db"
+        GITEA__log__LEVEL                  = "Info"
       }
       # Bind mount, not a named volume: /var/lib/gitea is the NFS export on
       # the nfs VM, so rebuilding this VM (even replacing its root disk)
-      # keeps the git repos. Replaces the old gitea-data named volume.
+      # keeps the git repos. Both backends mount the SAME NFS export, so
+      # repos are shared (no per-instance copy). Shared /data also means the
+      # SSH host keys under /data/gitea/ssh are identical on both backends,
+      # so git clients see a stable host key regardless of which backend the
+      # LB's :2222 round-robin picks -- no host-key-changed warnings.
       volumes = ["/var/lib/gitea:/data:Z"]
     },
     {
-      name       = "caddy"
-      image      = "docker.io/library/caddy:latest"
-      ports      = ["80:80", "443:443"]
-      depends_on = ["gitea"]
+      name  = "node-exporter"
+      image = "quay.io/prometheus/node-exporter:latest"
+      ports = ["9100:9100"]
+    },
+  ]
+}
+
+# ---------------------------------------------------------------------------
+# Gitea load balancer: gitea.lab.internal = gitea-lb (.29). A single caddy-l4
+# container (the same xcaddy build used by dns-lb, ghcr.io/chris-briddock/
+# caddy-l4:latest) runs TWO caddy apps from one JSON config:
+#   - apps.http: terminates TLS on :443 with a step-ca ACME cert for
+#     gitea.lab.internal, reverse_proxy round-robin to gitea-1:3000 +
+#     gitea-2:3000 (active health checks via /api/v1/version).
+#   - apps.layer4: L4 TCP :2222 round-robins git-over-SSH to the backends'
+#     :2222 (raw TCP passthrough -- the backends' gitea container owns the
+#     SSH handshake). Git SSH is stateless per-connection, so L4 round-robin
+#     is safe.
+# :80 is served by the http app itself for ACME HTTP-01 (the LB holds the
+# cert, so unlike dns-lb it serves its own challenge tokens -- no L4
+# forward to backends needed). One caddy-l4 container therefore replaces
+# both the per-backend Caddy that used to terminate TLS AND a separate SSH
+# LB. The LB resolves through var.vhost_dns (public upstream) for the same
+# bootstrap-independence reason as dns-lb: it must not depend on the very
+# internal DNS / Gitea backends it fronts.
+# ---------------------------------------------------------------------------
+locals {
+  # Combined caddy-l4 JSON: apps.http (TLS-terminate + reverse_proxy) and
+  # apps.layer4 (:2222 SSH L4 round-robin). JSON because layer4 has no
+  # caddyfile adapter (same constraint as dns_lb_caddyfile). The http server
+  # uses the standard caddyfile-less JSON site/route form; the layer4 server
+  # mirrors dns_lb_caddyfile's proxy handler shape.
+  gitea_lb_caddyfile = jsonencode({
+    apps = {
+      http = {
+        servers = {
+          gitea = {
+            # :443 terminates TLS (ACME cert for gitea.lab.internal, issued
+            # by step-ca via the acme issuer below). :80 serves ACME HTTP-01
+            # challenge tokens (caddy auto-handles /.well-known/...).
+            listen = [":443", ":80"]
+            routes = [
+              {
+                match = [{ host = ["gitea.${local.internal_domain}"] }]
+                handle = [{
+                  handler = "subroute"
+                  routes = [
+                    {
+                      # All traffic (web UI, API, git smart HTTP) -> round-robin
+                      # across both backends. lb_policy defaults to random.
+                      # Active health check: polls /api/v1/version every 10s
+                      # and pulls a 5xx/unhealthy backend out of rotation. The
+                      # JSON schema nests health config under health_checks.active
+                      # (uri + interval in nanoseconds), NOT the flat
+                      # health_uri/health_interval Caddyfile-DSL names -- the
+                      # flat fields are rejected by caddy v2.11.4 (verified via
+                      # `caddy adapt` of the equivalent Caddyfile block).
+                      handle = [{
+                        handler = "reverse_proxy"
+                        health_checks = {
+                          active = {
+                            uri      = "/api/v1/version"
+                            interval = 10000000000
+                          }
+                        }
+                        upstreams = [
+                          { dial = "${local.gitea_vms["gitea-1"]}:3000" },
+                          { dial = "${local.gitea_vms["gitea-2"]}:3000" },
+                        ]
+                      }]
+                    },
+                  ]
+                }]
+              },
+            ]
+            # TLS: step-ca ACME. The trusted_roots_pem_files array (below in
+            # apps.tls.automation) pins the lab root CA so caddy trusts
+            # step-ca's directory endpoint; the cert is issued for
+            # gitea.lab.internal (the site's host).
+            tls_connection_policies = [{}]
+          }
+        }
+      }
+      tls = {
+        automation = {
+          policies = [
+            {
+              subjects = ["gitea.${local.internal_domain}"]
+              issuers = [{
+                module = "acme"
+                ca     = "https://ca.${local.internal_domain}:9000/acme/acme/directory"
+                # trusted_roots_pem_files (an array, NOT the scalar Caddyfile-DSL
+                # "trusted_roots") validates step-ca's TLS endpoint against the
+                # lab root CA. Verified against the caddy-l4 v2.11.4 JSON schema
+                # via `caddy adapt` of the equivalent Caddyfile block.
+                trusted_roots_pem_files = ["/etc/caddy/root_ca.crt"]
+              }]
+            }
+          ]
+        }
+      }
+      layer4 = {
+        servers = {
+          # git-over-SSH: L4 TCP round-robin to the backends' :2222. Raw TCP
+          # passthrough -- the gitea container's sshd owns the handshake.
+          git-ssh = {
+            listen = [":2222"]
+            routes = [{
+              handle = [{
+                handler = "proxy"
+                upstreams = [
+                  { dial = ["tcp/${local.gitea_vms["gitea-1"]}:2222"] },
+                  { dial = ["tcp/${local.gitea_vms["gitea-2"]}:2222"] },
+                ]
+              }]
+            }]
+          }
+        }
+      }
+    }
+  })
+}
+
+module "gitea_lb" {
+  source    = "./modules/vm"
+  providers = { libvirt = libvirt.vhost }
+
+  name             = "gitea-lb-vm"
+  pool_name        = libvirt_pool.vhost.name
+  base_volume_path = libvirt_volume.base_vhost.path
+  vcpu             = 1
+  memory_mib       = 512
+  disk_gib         = 5
+  bridge           = var.vhost_bridge
+  static_ip        = "${local.service_ips.gitea-lb}${var.vhost_lan_cidr_suffix}"
+  gateway          = var.vhost_gateway
+  # Resolve through the public upstream, NOT the internal DNS: the backends
+  # and the CA come up around the same time, and the LB must bootstrap its own
+  # caddy image pull independently. Same reasoning as module.dns_lb.
+  dns            = var.vhost_dns
+  firmware       = var.uefi_firmware
+  nvram_template = var.uefi_nvram_template
+  vm_user        = var.vm_user
+  ssh_public_key = trimspace(file(pathexpand(var.ssh_public_key_path)))
+
+  extra_files = [
+    { path = "/etc/infra/caddy.json", content = local.gitea_lb_caddyfile },
+    { path = "/etc/infra/root_ca.crt", content = local.root_ca_cert_pem },
+  ]
+
+  containers = [
+    {
+      name = "caddy"
+      # Same caddy-l4 build as dns-lb: bundles layer4 + the standard http/
+      # reverse_proxy/tls/acme modules (verified with `caddy list-modules`),
+      # so one container runs both apps.http (:443 TLS terminate + LB) and
+      # apps.layer4 (:2222 SSH L4 round-robin) from the single JSON config.
+      image = "ghcr.io/chris-briddock/caddy-l4:latest"
+      # JSON config (native caddy format -- no --adapter): layer4 has no
+      # caddyfile adapter, and this custom xcaddy build bundles no adapters
+      # at all, so `--adapter` would fail. Same pattern as dns-lb.
+      command = "caddy run --config /etc/caddy/caddy.json"
+      # :443 = TLS-terminated Gitea HTTP LB; :80 = ACME HTTP-01; :2222 = L4
+      # git-over-SSH round-robin. Bind to the LB's LAN IP explicitly.
+      ports = [
+        "${local.service_ips.gitea-lb}:80:80",
+        "${local.service_ips.gitea-lb}:443:443",
+        "${local.service_ips.gitea-lb}:2222:2222",
+      ]
+      # caddy needs to reach step-ca (ca.lab.internal:9000) for ACME. It
+      # resolves via vhost_dns (public), which can't resolve lab.internal,
+      # so pin ca.lab.internal to the CA VM's fixed IP.
+      extra_args = ["--add-host", "ca.lab.internal:${local.service_ips.ca}"]
       volumes = [
-        "/etc/infra/Caddyfile:/etc/caddy/Caddyfile:Z",
+        "/etc/infra/caddy.json:/etc/caddy/caddy.json:Z",
         "/etc/infra/root_ca.crt:/etc/caddy/root_ca.crt:Z",
         "caddy-data:/data",
       ]
